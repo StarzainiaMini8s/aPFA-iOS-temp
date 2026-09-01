@@ -102,10 +102,11 @@ targets:
       - sdk: UIKit.framework
       - sdk: Foundation.framework
 
-    info:
-      path: Info.plist
-      properties:
-        CFBundleIdentifier: com.apfa.ios
+    # NO `info:` block here, deliberately. XcodeGen's `info.path` GENERATES an
+    # Info.plist at that path and overwrites whatever is there, which silently
+    # dropped UILaunchStoryboardName, UIFileSharingEnabled and the opengles-2
+    # capability, and produced a letterboxed 320x480 app whose FPS numbers were
+    # for the wrong resolution. INFOPLIST_FILE below points at the real file.
 
     settings:
       base:

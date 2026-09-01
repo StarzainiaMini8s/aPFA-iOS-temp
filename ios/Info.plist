@@ -39,6 +39,12 @@
 	<key>UILaunchStoryboardName</key>
 	<string>LaunchScreen</string>
 
+	<!-- Playback owns the whole screen. Without this, iPad Slide Over and
+	     Split View can resize the drawable mid-run, which would change the
+	     pixel count the renderer is being measured at partway through a piece. -->
+	<key>UIRequiresFullScreen</key>
+	<true/>
+
 	<key>UIRequiredDeviceCapabilities</key>
 	<array>
 		<string>arm64</string>
