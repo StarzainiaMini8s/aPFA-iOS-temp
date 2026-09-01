@@ -13,6 +13,12 @@ options:
     iOS: "12.0"
   createIntermediateGroups: true
   generateEmptyDirectories: true
+  # XcodeGen defaults to the Xcode 16 project format (objectVersion 77), which
+  # Xcode 15.4 on the macos-14 runner refuses with "a future Xcode project file
+  # format (77)". The Xcode version is not free to change here — it is pinned by
+  # the iOS 12.0 deployment target — so the PROJECT FORMAT follows the Xcode,
+  # not the other way round. Raise this only if the deployment floor ever moves.
+  projectFormat: xcode15_0
 
 settings:
   base:
