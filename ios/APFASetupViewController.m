@@ -131,52 +131,86 @@ static int progressFromSpeed(float s) {
                                UIViewAutoresizingFlexibleHeight;
     [self.view addSubview:_scroll];
 
-    UIStackView *stack = [[UIStackView alloc] init];
-    stack.axis         = UILayoutConstraintAxisVertical;
-    stack.spacing      = 12;
-    stack.translatesAutoresizingMaskIntoConstraints = NO;
-    [_scroll addSubview:stack];
+    // TWO COLUMNS, because this screen is landscape-only — see Info.plist, which
+    // mirrors AndroidManifest's screenOrientation="sensorLandscape" on both
+    // activities. A single vertical list (what this used to be) turns into a
+    // cramped scrolling strip at 568x320 on a 4-inch device. The split also
+    // follows MainActivity's own arrangement: file pickers on the left, the
+    // settings panel on the right.
+    UIStackView *columns = [[UIStackView alloc] init];
+    columns.axis         = UILayoutConstraintAxisHorizontal;
+    columns.spacing      = 20;
+    columns.alignment    = UIStackViewAlignmentFill;
+    columns.distribution = UIStackViewDistributionFillEqually;
+    columns.translatesAutoresizingMaskIntoConstraints = NO;
+    [_scroll addSubview:columns];
 
     UILayoutGuide *guide = self.view.layoutMarginsGuide;
     [NSLayoutConstraint activateConstraints:@[
-        [stack.topAnchor      constraintEqualToAnchor:_scroll.topAnchor constant:24],
-        [stack.bottomAnchor   constraintEqualToAnchor:_scroll.bottomAnchor constant:-24],
-        [stack.leadingAnchor  constraintEqualToAnchor:guide.leadingAnchor],
-        [stack.trailingAnchor constraintEqualToAnchor:guide.trailingAnchor],
+        [columns.topAnchor      constraintEqualToAnchor:_scroll.topAnchor constant:16],
+        [columns.bottomAnchor   constraintEqualToAnchor:_scroll.bottomAnchor constant:-16],
+        [columns.leadingAnchor  constraintEqualToAnchor:guide.leadingAnchor],
+        [columns.trailingAnchor constraintEqualToAnchor:guide.trailingAnchor],
     ]];
 
+    UIStackView *left  = [self column];
+    UIStackView *right = [self column];
+    [columns addArrangedSubview:left];
+    [columns addArrangedSubview:right];
+
+    // ---- left: what to play, and Play ----
     _midiButton = [self buttonTitled:@"Choose MIDI..." action:@selector(pickMidi)];
-    [stack addArrangedSubview:_midiButton];
+    [left addArrangedSubview:_midiButton];
 
     _sfButton = [self buttonTitled:@"Choose Soundfont..." action:@selector(pickSoundfont)];
-    [stack addArrangedSubview:_sfButton];
+    [left addArrangedSubview:_sfButton];
 
+    // Eats the slack so Play sits at the bottom of the column whatever the
+    // screen height, rather than floating directly under the SF button.
+    UIView *spacer = [[UIView alloc] init];
+    [spacer setContentHuggingPriority:UILayoutPriorityDefaultLow
+                              forAxis:UILayoutConstraintAxisVertical];
+    [left addArrangedSubview:spacer];
+
+    _playButton = [self buttonTitled:@"Play" action:@selector(play)];
+    _playButton.titleLabel.font = [UIFont boldSystemFontOfSize:20];
+    [_playButton.heightAnchor constraintEqualToConstant:52].active = YES;
+    [left addArrangedSubview:_playButton];
+
+    UILabel *tip = [self label:
+        @"MIDIs and soundfonts can also go in aPFA's folder in the Files app "
+         "(On My iPhone -> aPFA), or over USB."];
+    tip.font = [UIFont systemFontOfSize:12];
+    tip.textColor = [UIColor colorWithWhite:1 alpha:0.55];
+    [left addArrangedSubview:tip];
+
+    // ---- right: the settings panel ----
     _voiceLabel  = [self label:@"Voice Count"];
-    [stack addArrangedSubview:_voiceLabel];
+    [right addArrangedSubview:_voiceLabel];
     _voiceSlider = [[UISlider alloc] init];
     _voiceSlider.minimumValue = 1;
     _voiceSlider.maximumValue = 500;
     _voiceSlider.value        = _voiceCount;
     [_voiceSlider addTarget:self action:@selector(voiceChanged)
            forControlEvents:UIControlEventValueChanged];
-    [stack addArrangedSubview:_voiceSlider];
+    [right addArrangedSubview:_voiceSlider];
 
     _speedLabel  = [self label:@"Note Speed"];
-    [stack addArrangedSubview:_speedLabel];
+    [right addArrangedSubview:_speedLabel];
     _speedSlider = [[UISlider alloc] init];
     _speedSlider.minimumValue = 0;
     _speedSlider.maximumValue = 1000;
     _speedSlider.value        = progressFromSpeed(_noteSpeed);
     [_speedSlider addTarget:self action:@selector(speedChanged)
            forControlEvents:UIControlEventValueChanged];
-    [stack addArrangedSubview:_speedSlider];
+    [right addArrangedSubview:_speedSlider];
 
-    [stack addArrangedSubview:[self label:@"Background"]];
+    [right addArrangedSubview:[self label:@"Background"]];
     _colorSwatch = [[UIView alloc] init];
     _colorSwatch.layer.borderColor = [UIColor whiteColor].CGColor;
     _colorSwatch.layer.borderWidth = 1;
-    [_colorSwatch.heightAnchor constraintEqualToConstant:28].active = YES;
-    [stack addArrangedSubview:_colorSwatch];
+    [_colorSwatch.heightAnchor constraintEqualToConstant:24].active = YES;
+    [right addArrangedSubview:_colorSwatch];
 
     _rSlider = [self colorSlider];
     _gSlider = [self colorSlider];
@@ -186,28 +220,29 @@ static int progressFromSpeed(float s) {
     _rSlider.value = (_bgColor >>  0) & 0xFF;
     _gSlider.value = (_bgColor >>  8) & 0xFF;
     _bSlider.value = (_bgColor >> 16) & 0xFF;
-    [stack addArrangedSubview:_rSlider];
-    [stack addArrangedSubview:_gSlider];
-    [stack addArrangedSubview:_bSlider];
+    [right addArrangedSubview:_rSlider];
+    [right addArrangedSubview:_gSlider];
+    [right addArrangedSubview:_bSlider];
 
+    // Short titles: at half the width of a 4-inch landscape screen these two
+    // sit in ~120 pt each, and "Background Image..." truncated to
+    // "Backgro...Image...".
     UIStackView *imgRow = [[UIStackView alloc] init];
     imgRow.axis = UILayoutConstraintAxisHorizontal;
     imgRow.spacing = 8;
     imgRow.distribution = UIStackViewDistributionFillEqually;
-    [imgRow addArrangedSubview:[self buttonTitled:@"Background Image..."
+    [imgRow addArrangedSubview:[self buttonTitled:@"Image..."
                                            action:@selector(pickBgImage)]];
-    [imgRow addArrangedSubview:[self buttonTitled:@"Clear Image"
+    [imgRow addArrangedSubview:[self buttonTitled:@"Clear"
                                            action:@selector(clearBgImage)]];
-    [stack addArrangedSubview:imgRow];
+    [right addArrangedSubview:imgRow];
+}
 
-    _playButton = [self buttonTitled:@"Play" action:@selector(play)];
-    _playButton.titleLabel.font = [UIFont boldSystemFontOfSize:20];
-    [_playButton.heightAnchor constraintEqualToConstant:52].active = YES;
-    [stack addArrangedSubview:_playButton];
-
-    [stack addArrangedSubview:[self label:
-        @"Tip: MIDIs and soundfonts can also be dropped into aPFA's folder in "
-         "the Files app (On My iPhone -> aPFA), or over USB in Finder."]];
+- (UIStackView *)column {
+    UIStackView *c = [[UIStackView alloc] init];
+    c.axis    = UILayoutConstraintAxisVertical;
+    c.spacing = 10;
+    return c;
 }
 
 - (UILabel *)label:(NSString *)text {

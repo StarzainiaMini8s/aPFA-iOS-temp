@@ -62,9 +62,12 @@
 }
 
 - (BOOL)prefersStatusBarHidden { return YES; }
-- (UIInterfaceOrientationMask)supportedInterfaceOrientations {
-    return UIInterfaceOrientationMaskAll;
-}
+// No supportedInterfaceOrientations override here on purpose: this controller
+// lives inside a UINavigationController, which does NOT forward that call to
+// its children, so an override would be dead code that reads as policy. The
+// orientation set in Info.plist (landscape only, matching Android's
+// sensorLandscape) governs both screens. Status bar appearance IS forwarded to
+// the top view controller, so prefersStatusBarHidden above does take effect.
 
 #pragma mark - lifecycle
 

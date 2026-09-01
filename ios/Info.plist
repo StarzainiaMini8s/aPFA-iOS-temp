@@ -51,18 +51,23 @@
 		<string>opengles-2</string>
 	</array>
 
-	<!-- Playback is fullscreen and rotates freely; the note field is laid out
-	     from the drawable's real pixel size every time it changes. -->
+	<!-- LANDSCAPE ONLY, both ways up. This is the exact equivalent of
+	     AndroidManifest.xml's android:screenOrientation="sensorLandscape",
+	     which BOTH aPFA activities declare. The note field is a wide
+	     playfield with the keyboard along the bottom edge — portrait is not
+	     a supported way to look at it, on either platform. Listing Portrait
+	     here (and first) is what made the app launch upright on an iPhone SE.
+
+	     Note that a per-view-controller supportedInterfaceOrientations
+	     override does NOT work here: UINavigationController does not forward
+	     that call to its children. This list is the whole policy. -->
 	<key>UISupportedInterfaceOrientations</key>
 	<array>
-		<string>UIInterfaceOrientationPortrait</string>
 		<string>UIInterfaceOrientationLandscapeLeft</string>
 		<string>UIInterfaceOrientationLandscapeRight</string>
 	</array>
 	<key>UISupportedInterfaceOrientations~ipad</key>
 	<array>
-		<string>UIInterfaceOrientationPortrait</string>
-		<string>UIInterfaceOrientationPortraitUpsideDown</string>
 		<string>UIInterfaceOrientationLandscapeLeft</string>
 		<string>UIInterfaceOrientationLandscapeRight</string>
 	</array>
