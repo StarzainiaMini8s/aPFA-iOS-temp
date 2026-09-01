@@ -1,0 +1,49 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  LaunchScreen.storyboard — a plain dark screen, and the reason the app runs at
+  the device's real resolution.
+
+  Without launch assets iOS assumes a 320x480 app and letterboxes everything,
+  which would silently halve the pixel count the renderer is measured at and
+  make every FPS number a lie. ibtool (Xcode) compiles this into
+  LaunchScreen.storyboardc at build time — see ios/README.md for what the
+  Linux cross-compile path does instead, since ibtool is macOS-only.
+-->
+<document type="com.apple.InterfaceBuilder3.CocoaTouch.Storyboard.XIB" version="3.0" toolsVersion="21507" targetRuntime="iOS.CocoaTouch" propertyAccessControl="none" useAutolayout="YES" launchScreen="YES" useTraitCollections="YES" useSafeAreas="YES" colorMatched="YES" initialViewController="01J-lp-oVM">
+    <device id="retina4_7" orientation="portrait" appearance="light"/>
+    <dependencies>
+        <plugIn identifier="com.apple.InterfaceBuilder.IBCocoaTouchPlugin" version="21505"/>
+        <capability name="Safe area layout guides" minToolsVersion="9.0"/>
+        <capability name="System colors in document resources" minToolsVersion="11.0"/>
+        <capability name="documents saved in the Xcode 8 format" minToolsVersion="8.0"/>
+    </dependencies>
+    <scenes>
+        <!--View Controller-->
+        <scene sceneID="EHf-IW-A2E">
+            <objects>
+                <viewController id="01J-lp-oVM" sceneMemberID="viewController">
+                    <view key="view" contentMode="scaleToFill" id="Ze5-6b-2t3">
+                        <rect key="frame" x="0.0" y="0.0" width="375" height="667"/>
+                        <autoresizingMask key="autoresizingMask" widthSizable="YES" heightSizable="YES"/>
+                        <subviews>
+                            <label opaque="NO" userInteractionEnabled="NO" contentMode="left" horizontalHuggingPriority="251" verticalHuggingPriority="251" text="aPFA" textAlignment="center" lineBreakMode="tailTruncation" baselineAdjustment="alignBaselines" adjustsFontSizeToFit="NO" translatesAutoresizingMaskIntoConstraints="NO" id="ap0-3g-Wf1">
+                                <rect key="frame" x="152.5" y="316" width="70" height="35"/>
+                                <fontDescription key="fontDescription" type="boldSystem" pointSize="29"/>
+                                <color key="textColor" red="1" green="1" blue="1" alpha="1" colorSpace="custom" customColorSpace="sRGB"/>
+                                <nil key="highlightedColor"/>
+                            </label>
+                        </subviews>
+                        <viewLayoutGuide key="safeArea" id="6Tk-OE-BBY"/>
+                        <color key="backgroundColor" red="0.07058823529411765" green="0.07058823529411765" blue="0.09411764705882353" alpha="1" colorSpace="custom" customColorSpace="sRGB"/>
+                        <constraints>
+                            <constraint firstItem="ap0-3g-Wf1" firstAttribute="centerX" secondItem="6Tk-OE-BBY" secondAttribute="centerX" id="c1-aa-001"/>
+                            <constraint firstItem="ap0-3g-Wf1" firstAttribute="centerY" secondItem="6Tk-OE-BBY" secondAttribute="centerY" id="c2-aa-002"/>
+                        </constraints>
+                    </view>
+                </viewController>
+                <placeholder placeholderIdentifier="IBFirstResponder" id="iYj-Kq-Ea1" userLabel="First Responder" sceneMemberID="firstResponder"/>
+            </objects>
+            <point key="canvasLocation" x="53" y="375"/>
+        </scene>
+    </scenes>
+</document>

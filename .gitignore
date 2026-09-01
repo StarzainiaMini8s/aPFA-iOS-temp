@@ -1,0 +1,6 @@
+# Downloaded by CI / `make -C ios deps`, never committed.
+bass24-ios/
+bassmidi24-ios/
+ios/aPFA.xcodeproj/
+ios/build/
+build/

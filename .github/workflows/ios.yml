@@ -1,0 +1,72 @@
+# Builds an UNSIGNED aPFA .ipa on a free GitHub-hosted macOS runner.
+#
+# No Mac, Apple Developer account, certificate, or provisioning profile is
+# needed: AltStore / Sideloadly re-sign the .ipa with your own free Apple ID at
+# install time. Download the artifact from the run, then sideload it onto the
+# iPhone. This is the primary build path for the iOS port — see ios/README.md.
+#
+# Assumes this repo's root is the aPFA source folder (so ios/, app/, etc. are at
+# the top level). Trigger manually from the Actions tab, or on push to
+# main/master.
+name: build-ios-ipa
+
+on:
+  push:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-14          # Xcode 15.x — supports an iOS 12.0 deployment target
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install XcodeGen
+        run: brew install xcodegen
+
+      # BASS and BASSMIDI are un4seen's, redistributable but not ours to vendor,
+      # so they are not in the repo. The Android build has the same split
+      # (bass24-android / bassmidi24-android sit next to the source tree); these
+      # land in the sibling directories project.yml points its header search
+      # paths and framework dependencies at.
+      - name: Fetch BASS + BASSMIDI for iOS
+        run: |
+          set -euo pipefail
+          curl -fsSL -o bass24-ios.zip     https://www.un4seen.com/files/bass24-ios.zip
+          curl -fsSL -o bassmidi24-ios.zip https://www.un4seen.com/files/bassmidi24-ios.zip
+          unzip -q bass24-ios.zip     -d bass24-ios
+          unzip -q bassmidi24-ios.zip -d bassmidi24-ios
+          # Fail loudly here rather than 200 lines into a link error.
+          test -f bass24-ios/bass.h
+          test -f bassmidi24-ios/bassmidi.h
+          test -d bass24-ios/bass.xcframework
+          test -d bassmidi24-ios/bassmidi.xcframework
+
+      - name: Generate Xcode project
+        run: cd ios && xcodegen generate
+
+      - name: Build (unsigned)
+        run: |
+          xcodebuild \
+            -project ios/aPFA.xcodeproj \
+            -scheme aPFA \
+            -sdk iphoneos \
+            -configuration Release \
+            -derivedDataPath build \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" \
+            build
+
+      - name: Package unsigned .ipa
+        run: |
+          set -euo pipefail
+          APP=$(find build/Build/Products/Release-iphoneos -maxdepth 1 -name '*.app' | head -1)
+          echo "Packaging $APP"
+          mkdir -p Payload
+          cp -R "$APP" Payload/
+          zip -qry aPFA-unsigned.ipa Payload
+
+      - name: Upload .ipa artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: aPFA-unsigned-ipa
+          path: aPFA-unsigned.ipa

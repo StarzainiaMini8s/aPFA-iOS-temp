@@ -1,0 +1,131 @@
+# project.yml — XcodeGen spec for the iOS app.
+#
+# There is no .xcodeproj checked in on purpose: a pbxproj is a merge-hostile
+# generated file, and this repo's only Xcode is a CI runner. `xcodegen generate`
+# produces aPFA.xcodeproj from this file in about a second. See ios/README.md.
+#
+# Run it from THIS directory (ios/); all paths below are relative to it.
+name: aPFA
+
+options:
+  bundleIdPrefix: com.apfa
+  deploymentTarget:
+    iOS: "12.0"
+  createIntermediateGroups: true
+  generateEmptyDirectories: true
+
+settings:
+  base:
+    # arm64 only. The floor device is an iPhone 5S, which is arm64 — the last
+    # armv7 iPhone (5C) tops out at iOS 10 and is below the floor anyway, and
+    # dropping armv7 halves the binary.
+    ARCHS: arm64
+    VALID_ARCHS: arm64
+    ONLY_ACTIVE_ARCH: NO
+    ENABLE_BITCODE: NO
+    TARGETED_DEVICE_FAMILY: "1,2"
+    CLANG_CXX_LANGUAGE_STANDARD: "c++17"
+    CLANG_CXX_LIBRARY: "libc++"
+    CLANG_ENABLE_OBJC_ARC: YES
+    # The legit run must reflect the fastest the hardware genuinely allows, so
+    # the engine is optimised in Debug too — an -O0 engine would be unfaithful
+    # and every timing number taken from it meaningless. Same rule as the
+    # Android CMakeLists' target_compile_options(-O2).
+    GCC_OPTIMIZATION_LEVEL: "2"
+    # OpenGL ES is deprecated on iOS 12 but fully functional, and it is what the
+    # shared renderer speaks. Silence the deprecation noise rather than port to
+    # Metal — see the port notes on why EAGL and not Metal.
+    GCC_PREPROCESSOR_DEFINITIONS:
+      - "GLES_SILENCE_DEPRECATION=1"
+      - "$(inherited)"
+    HEADER_SEARCH_PATHS:
+      - "$(SRCROOT)/../app/src/main/cpp"
+      - "$(SRCROOT)/../bass24-ios"
+      - "$(SRCROOT)/../bassmidi24-ios"
+      - "$(inherited)"
+
+targets:
+  aPFA:
+    type: application
+    platform: iOS
+
+    sources:
+      # The iOS platform layer.
+      - path: .
+        excludes:
+          - "project.yml"
+          - "Makefile"
+          - "README.md"
+          - "build"
+
+      # The shared C++ engine, used UNCHANGED. Only platform glue differs, and
+      # all of it is behind #ifdef __APPLE__ inside these same files.
+      - path: ../app/src/main/cpp
+        excludes:
+          - "CMakeLists.txt"
+          # JNI surface — Android only. apfa_bridge.mm replaces it.
+          - "native-lib.cpp"
+          # RendererES3 is Android-only: it includes <android/*> unguarded, and
+          # createRenderer() on Apple always returns RendererES2 anyway (which
+          # asks for an ES3 context by itself, so nothing is lost).
+          - "renderer_es3.cpp"
+          - "renderer_es3.h"
+          # The streaming pool is not compiled into iOS — APFA_STREAMING is
+          # never defined here, so engine.cpp takes the pure in-RAM parse and
+          # nothing references these. iOS has no swap: a MIDI that does not fit
+          # in RAM cannot be played on the device at all, pagefile or not.
+          - "streamer.cpp"
+          - "streamer.h"
+
+    dependencies:
+      # Both are prebuilt xcframeworks from un4seen. They are NOT in the repo —
+      # `make deps` (or the CI workflow) downloads them next to bass24-android
+      # and bassmidi24-android.
+      - framework: ../bass24-ios/bass.xcframework
+        embed: true
+        codeSign: true
+      - framework: ../bassmidi24-ios/bassmidi.xcframework
+        embed: true
+        codeSign: true
+      - sdk: OpenGLES.framework
+      - sdk: QuartzCore.framework
+      - sdk: AudioToolbox.framework
+      - sdk: AVFoundation.framework
+      - sdk: CoreGraphics.framework
+      - sdk: MobileCoreServices.framework
+      - sdk: UIKit.framework
+      - sdk: Foundation.framework
+
+    info:
+      path: Info.plist
+      properties:
+        CFBundleIdentifier: com.apfa.ios
+
+    settings:
+      base:
+        PRODUCT_NAME: aPFA
+        PRODUCT_BUNDLE_IDENTIFIER: com.apfa.ios
+        INFOPLIST_FILE: Info.plist
+        # Left empty so an unsigned archive can be produced on a CI runner with
+        # no Apple account; Sideloadly/AltStore re-signs it on the way to the
+        # device. Set these locally if you ever do have a signing identity.
+        CODE_SIGN_IDENTITY: ""
+        CODE_SIGNING_REQUIRED: NO
+        CODE_SIGNING_ALLOWED: NO
+        CODE_SIGN_STYLE: Manual
+
+# xcodebuild -scheme needs a shared scheme to exist in the generated project;
+# XcodeGen does not invent one on its own. The CI workflow builds by scheme
+# name, so declare it here rather than letting the build fail with
+# "scheme aPFA not found" on a clean checkout.
+schemes:
+  aPFA:
+    build:
+      targets:
+        aPFA: all
+    run:
+      config: Release
+    profile:
+      config: Release
+    archive:
+      config: Release
