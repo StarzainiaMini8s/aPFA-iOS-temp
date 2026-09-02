@@ -36,7 +36,13 @@
 #include <sys/mman.h>
 #include <sys/resource.h>
 #include <sys/stat.h>
-#include <sys/statfs.h>
+#if defined(__APPLE__)
+  // Darwin has no <sys/statfs.h>; struct statfs and fstatfs live here.
+  #include <sys/param.h>
+  #include <sys/mount.h>
+#else
+  #include <sys/statfs.h>
+#endif
 #include <sys/statvfs.h>
 #include <sys/syscall.h>
 #include <unistd.h>
@@ -44,10 +50,34 @@
 
 #include "platform.h"
 
+// The reservation asks for MAP_NORESERVE by name. Linux honours it, Darwin
+// defines it and ignores it (a PROT_NONE anonymous range commits nothing there
+// either way); anything else must still compile.
+#ifndef MAP_NORESERVE
+  #define MAP_NORESERVE 0
+#endif
+
 namespace apfa {
 namespace {
 
+// The granularity every pool offset and length is rounded to. It must be a
+// MULTIPLE of the kernel's real page size: mmap rejects a file offset that is
+// not page-aligned, and kSegGrain below — the LCM of this and the 72-byte event
+// — is what makes every pool-file boundary simultaneously page-aligned and
+// event-aligned.
+//
+// Apple's arm64 kernels use 16 KB pages. With 4096 here kSegGrain would be
+// 36864, which is NOT a multiple of 16384, and the first mapping at a file
+// boundary would fail with EINVAL three passes and several GB into the load.
+// Rounding UP is always safe (a 16 KB-aligned offset is also 4 KB-aligned, and
+// 147456 divides by both), rounding down is fatal — so Apple takes 16384
+// whether or not a particular device turns out to use it, and Streamer::open
+// re-checks the assumption against sysconf at runtime.
+#if defined(__APPLE__)
+constexpr size_t kPageSize   = 16384;
+#else
 constexpr size_t kPageSize   = 4096;
+#endif
 constexpr size_t kBufEvents  = 131072;   // pass-B write buffer (~9 MB)
 constexpr size_t kEventSize  = sizeof(PlayEvent);
 constexpr size_t kRunEntries = 2097152;  // sort-run spill threshold (32 MB)
@@ -358,6 +388,12 @@ inline bool sortKeyLess(const SortKey& a, const SortKey& b) {
 // files grow (one fstatvfs per ~multi-MB write, cost is noise).
 constexpr double kMinFreeDiskFraction = 0.02;
 
+// On iOS f_bavail UNDER-reports: APFS purgeable space (caches the system would
+// evict to make room) is not counted, which is why Apple points at
+// NSURLVolumeAvailableCapacityForImportantUsageKey instead. That error runs in
+// the safe direction here — the guard refuses a load that might just have fitted
+// rather than filling the volume — so this stays a plain fstatvfs and does not
+// drag Foundation into the shared engine.
 bool wouldExhaustDisk(int fd, uint64_t moreBytes) {
     struct statvfs vfs;
     if (fstatvfs(fd, &vfs) != 0) return false;   // can't tell — don't block the load
@@ -457,8 +493,15 @@ constexpr uint64_t kFat32MaxFileBytes = 0xFFFFFFFFull;   // 4 GB - 1
 bool exceedsFileSizeLimit(int fd, uint64_t bytes) {
     struct statfs sfs;
     if (fstatfs(fd, &sfs) != 0) return false;
+#if defined(__APPLE__)
+    // Darwin reports the filesystem by name and numbers f_type its own way, so
+    // the Linux MSDOS magic means nothing here. An iOS pool always lands in the
+    // app container on APFS; this only ever fires if that stops being true.
+    return strcmp(sfs.f_fstypename, "msdos") == 0 && bytes > kFat32MaxFileBytes;
+#else
     return static_cast<unsigned long>(sfs.f_type) == 0x4d44ul &&   // MSDOS_SUPER_MAGIC
            bytes > kFat32MaxFileBytes;
+#endif
 }
 
 // A CC / ProgramChange / PitchBend event's payload, kept beside its pool index
@@ -716,6 +759,16 @@ uint64_t meminfoField(const char* buf, const char* name) {
 }
 
 uint64_t readMemAvailable() {
+#if defined(__APPLE__)
+    // No /proc here, and no system-wide "available" worth having: what bounds
+    // the read-ahead window on iOS is not what the machine has free but what
+    // THIS process may still touch before jetsam takes it, which is what
+    // platform::availableMemoryBytes() reports. Returning 0 — the old pre-3.14
+    // Linux behaviour — would skip window budgeting entirely; that was a bug on
+    // old Android kernels and would be a worse one on a platform whose memory
+    // ceiling is harder, so it is not an option here.
+    return apfa::platform::availableMemoryBytes();
+#else
     int fd = ::open("/proc/meminfo", O_RDONLY);
     if (fd < 0) return 0;
     char buf[2048];
@@ -747,6 +800,7 @@ uint64_t readMemAvailable() {
     const uint64_t swapCac = meminfoField(buf, "SwapCached:");
     const uint64_t pagecache = cached > swapCac ? cached - swapCac : 0;
     return freeB + buffers / 2 + pagecache / 2;
+#endif
 }
 
 }  // namespace
@@ -926,6 +980,21 @@ bool Streamer::open(const std::string& midiPath, MidiData& out,
     progress.store(0.0f);
     close();
     diskFull_ = fileTooBig_ = noAddrSpace_ = needsChunked_ = false;
+
+    // kPageSize is a compile-time constant that every offset in the pool is
+    // aligned to. If the running kernel's page is bigger than it assumes, every
+    // mapping at a segment or file boundary fails with EINVAL — and it fails
+    // three passes and several GB of writes in. One sysconf up front turns that
+    // into a clean refusal.
+    {
+        const long ps = sysconf(_SC_PAGESIZE);
+        if (ps > 0 && (kSegGrain % static_cast<size_t>(ps)) != 0) {
+            LOGE("streamer: kPageSize=%zu cannot back a %ld-byte page "
+                 "(kSegGrain=%zu) — refusing the load",
+                 kPageSize, ps, kSegGrain);
+            return false;
+        }
+    }
 
     // ---- map the MIDI file, parse the header (verbatim parseMidi) ----
     int fd = ::open(midiPath.c_str(), O_RDONLY);
@@ -1956,7 +2025,7 @@ void Streamer::builderMain() {
     uint64_t avoid = (~engineCpuMask_) & ncpuMask;
     if (engineCpuMask_ != 0) setThreadAffinityMaskSelf(avoid);
 #elif defined(__APPLE__)
-    apfa::platform::setAuxThreadPolicy();
+    apfa::platform::setLoaderThreadPolicy();
 #endif
     for (;;) {
         int want;
@@ -2562,7 +2631,7 @@ void Streamer::loaderMain() {
     uint64_t avoid = (~engineCpuMask_) & ncpuMask;
     if (engineCpuMask_ != 0) setThreadAffinityMaskSelf(avoid);
 #elif defined(__APPLE__)
-    apfa::platform::setAuxThreadPolicy();
+    apfa::platform::setLoaderThreadPolicy();
 #endif
     bool seenPlayhead = false;
     while (loaderRunning_.load()) {
@@ -2576,10 +2645,17 @@ void Streamer::loaderMain() {
         // Read-ahead faults, published for Engine::frame's "fault:" line.
         // Sampled outside the lock: the engine reads this without the mutex.
         {
+#if defined(RUSAGE_THREAD)
             struct rusage ru;
             if (getrusage(RUSAGE_THREAD, &ru) == 0)
                 loaderMajFlt_.store(static_cast<uint64_t>(ru.ru_majflt),
                                     std::memory_order_relaxed);
+#else
+            // Darwin offers only RUSAGE_SELF, and a process-wide fault count
+            // would read as engine stalls — see threadMajFlt() in engine.cpp.
+            // The counter stays 0 and the "fault:" line reports nothing rather
+            // than something that means something else.
+#endif
         }
         // 100 ms cadence. The horizon is only ~2 s now, so a tick advances the
         // front edge by ~5% of the window — the advisories stay well ahead of

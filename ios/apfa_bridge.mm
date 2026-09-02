@@ -22,17 +22,21 @@ std::string cstr(const char* s) { return s ? std::string(s) : std::string(); }
 extern "C" {
 
 bool apfaLoad(const char* midiPath, const char* sfPath,
-              int voiceCount, float noteSpeed) {
+              int voiceCount, float noteSpeed, bool allowChunked) {
     apfa::Engine* old = g_engine.exchange(nullptr);
     if (old) { old->stop(); delete old; }
 
     auto* e = new apfa::Engine();
     g_engine.store(e);                       // visible so progress can be polled
     // cpuMask 0 = "auto"; on iOS the engine takes the QoS path instead of any
-    // affinity call, so the value is inert. legacyRenderer / allowChunked /
-    // poolDir take their defaults — see engine.h, which defaults them precisely
-    // so this call can stay this short.
-    bool ok = e->load(cstr(midiPath), cstr(sfPath), voiceCount, noteSpeed, 0);
+    // affinity call, so the value is inert. legacyRenderer is always false (iOS
+    // gets RendererES2 either way). poolDir is left at its default, which puts
+    // the pool beside the MIDI: Documents/midi in the app container. That is
+    // the only writable volume there is here, and the temps are unlinked the
+    // moment they are created, so a crash mid-load cannot litter the user's
+    // Files.app folder with multi-GB leftovers.
+    bool ok = e->load(cstr(midiPath), cstr(sfPath), voiceCount, noteSpeed, 0,
+                      /*legacyRenderer=*/false, allowChunked);
     g_lastLoadError.store(e->loadError());
     if (!ok) {
         g_engine.store(nullptr);
@@ -57,6 +61,11 @@ int64_t apfaGetNoteCount(void) {
 int64_t apfaGetMemoryBytes(void) {
     apfa::Engine* e = g_engine.load();
     return e ? e->memoryBytes() : 0;
+}
+
+int64_t apfaGetStreamedBytes(void) {
+    apfa::Engine* e = g_engine.load();
+    return e ? e->streamedBytes() : 0;
 }
 
 void apfaStart(void* caeaglLayer) {

@@ -46,11 +46,11 @@ static uint64_t threadMajFlt() {
     // Darwin/iOS has no RUSAGE_THREAD — getrusage there offers only RUSAGE_SELF
     // (whole process) and RUSAGE_CHILDREN, and a process-wide count would defeat
     // the entire point of this counter, which is to separate an ENGINE-thread
-    // stall from the loader thread's read-ahead. There is nothing to separate on
-    // iOS anyway: the streaming pool is never compiled in there (no
-    // APFA_STREAMING), so the load is always RAM-resident, there is no loader
-    // thread, and the "fault:" line has no consumer. Report 0 rather than a
-    // number that would read as engine stalls and mean something else.
+    // stall from the loader thread's read-ahead. Since the streaming pool now
+    // builds for iOS there IS a loader thread to be confused with, which makes
+    // the process-wide number worse than useless, not merely redundant. Report 0
+    // rather than something that would read as engine stalls and mean the
+    // opposite; the "fault:" line simply stays at 0 on iOS.
     return 0;
 #endif
 }
@@ -79,10 +79,19 @@ void Engine::syncBgImage() {
 }
 
 #ifdef APFA_STREAMING
+#if defined(__APPLE__)
+// Fraction of the app's remaining jetsam headroom the predicted in-RAM parse
+// may use before the load is routed to the streaming pool instead
+// (Engine::load). Higher than Android's number because it applies to headroom
+// rather than to RAM: what it holds back is the renderer, BASS and UIKit's own
+// growth during the load, not the rest of the system.
+static constexpr double kStreamHeadroomFraction = 0.70;
+#else
 // Fraction of total device RAM the predicted in-RAM parse may use before the
 // load is routed to the streaming pool instead (Engine::load). ~40% of an
 // 8 GB phone ≈ the 3 GB the flushed-cache ceiling actually allows.
 static constexpr double kStreamRamFraction = 0.40;
+#endif
 
 // Peak non-pool cost of an UN-chunked streaming parse, per event. The sort
 // keys and pairs are the transient the name refers to, but they are not the
@@ -183,9 +192,10 @@ bool Engine::load(const std::string& midiPath, const std::string& soundfontPath,
     // legacy build, zero pagefile cost, zero extra storage writes. The
     // streaming pool takes over only when
     //   1. a fast read-only skim predicts the in-RAM footprint would exceed
-    //      kStreamRamFraction of the device's total RAM (so a MIDI that would
-    //      obviously die never burns a crash — or the eMMC writes of a doomed
-    //      attempt — finding out), or
+    //      the memory budget — a fraction of the device's total RAM on Android,
+    //      of this process's remaining jetsam headroom on iOS (see the basis
+    //      selection below) — so a MIDI that would obviously die never burns a
+    //      crash, or the eMMC writes of a doomed attempt, finding out; or
     //   2. a crash marker proves THIS MIDI already killed an in-RAM parse:
     //      the marker is written before parsing and only survives a process
     //      death; it is cleared once playback starts or on clean teardown,
@@ -199,10 +209,35 @@ bool Engine::load(const std::string& midiPath, const std::string& soundfontPath,
     markerPath_ = loadMarkerPath(midiPath);
     uint64_t fp = midiFingerprint(midiPath);
     uint64_t events = Streamer::predictEventCount(midiPath);
+#if defined(__APPLE__)
+    // iOS never hands an app the whole machine. Jetsam kills it at a per-process
+    // FOOTPRINT limit that is roughly half of RAM and is not derivable from it,
+    // so pricing the parse against a fraction of hw.memsize is pricing it
+    // against the wrong number: 40% of a 12 GB iPhone clears a 4.8 GB budget and
+    // then dies at the real ~3-4 GB wall — precisely the death this gate exists
+    // to avoid. The right basis is the app's own remaining headroom, measured
+    // now, before the parse allocates anything.
+    //
+    // It errs low on purpose: budgeting too small only makes a MIDI stream that
+    // might have fitted, budgeting too large earns a jetsam kill.
+    const char* budgetBasisName = "headroom";
+    const double budgetFraction = kStreamHeadroomFraction;
+    uint64_t totalRam    = apfa::platform::totalRamBytes();
+    uint64_t budgetBasis = apfa::platform::availableMemoryBytes();
+    // Both numbers, once per load: on iOS the gap between them IS the story
+    // when a load is refused, and there is no /proc for anyone to check it
+    // against afterwards.
+    LOGI("memory: %.2f GB RAM, %.2f GB headroom before jetsam",
+         totalRam / 1073741824.0, budgetBasis / 1073741824.0);
+#else
+    const char* budgetBasisName = "RAM";
+    const double budgetFraction = kStreamRamFraction;
     uint64_t totalRam =
         static_cast<uint64_t>(sysconf(_SC_PHYS_PAGES)) *
         static_cast<uint64_t>(sysconf(_SC_PAGESIZE));
-    uint64_t budget = static_cast<uint64_t>(totalRam * kStreamRamFraction);
+    uint64_t budgetBasis = totalRam;
+#endif
+    uint64_t budget = static_cast<uint64_t>(budgetBasis * budgetFraction);
     bool wantStream = false;
     // Whether the size prediction (not just the crash marker) said the in-RAM
     // parse cannot fit. If it did, "fall back to the in-RAM parse" is not a
@@ -211,15 +246,16 @@ bool Engine::load(const std::string& midiPath, const std::string& soundfontPath,
     if (markerMatches(markerPath_, fp)) {
         LOGI("previous load of this MIDI died — using the streaming pool");
         wantStream = true;
-    } else if (events > 0 && totalRam > 0) {
+    } else if (events > 0 && budgetBasis > 0) {
         uint64_t predictedBytes =
             events * (sizeof(PlayEvent) + sizeof(PlayEvent*));
         predictedTooBig = predictedBytes > budget;
         if (predictedTooBig) {
             LOGI("predicted in-RAM footprint %.1f MB > %.1f MB budget "
-                 "(%.0f%% of %.1f GB RAM) — using the streaming pool",
+                 "(%.0f%% of %.1f GB %s) — using the streaming pool",
                  predictedBytes / 1048576.0, budget / 1048576.0,
-                 kStreamRamFraction * 100.0, totalRam / 1073741824.0);
+                 budgetFraction * 100.0, budgetBasis / 1073741824.0,
+                 budgetBasisName);
             wantStream = true;
         }
     }
@@ -230,7 +266,7 @@ bool Engine::load(const std::string& midiPath, const std::string& soundfontPath,
     // time round, when streaming was not yet on the table.
     auto decideChunkedSort = [&]() -> bool {        // false => refuse, error set
         chunked = false;
-        if (events > 0 && totalRam > 0 &&
+        if (events > 0 && budgetBasis > 0 &&
             events * kSortTransientPerEvent > budget) {
             if (!allowChunked) {
                 LOGI("predicted sort transient %.1f MB > %.1f MB budget and "

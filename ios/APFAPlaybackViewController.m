@@ -22,6 +22,7 @@
     float     _noteSpeed;
     uint32_t  _bgColor;
     NSString *_bgImagePath;
+    BOOL      _chunkedStreaming;
 
     // loading screen
     UILabel      *_loadingLabel;
@@ -48,7 +49,8 @@
                       voiceCount:(int)voiceCount
                        noteSpeed:(float)noteSpeed
                          bgColor:(uint32_t)bgrColor
-                     bgImagePath:(NSString *)bgImagePath {
+                     bgImagePath:(NSString *)bgImagePath
+                chunkedStreaming:(BOOL)chunkedStreaming {
     self = [super initWithNibName:nil bundle:nil];
     if (!self) return nil;
     _midiPath    = [midiPath copy];
@@ -57,6 +59,7 @@
     _noteSpeed   = noteSpeed;
     _bgColor     = bgrColor;
     _bgImagePath = [bgImagePath copy];
+    _chunkedStreaming = chunkedStreaming;
     _infoLine    = @"";
     return self;
 }
@@ -179,7 +182,7 @@
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
         BOOL ok = apfaLoad(midi.fileSystemRepresentation,
                            sf.length ? sf.fileSystemRepresentation : "",
-                           voices, speed);
+                           voices, speed, self->_chunkedStreaming);
 
         // Decode + hand over the background image off the main thread (it can be
         // big). The engine just stashes it; the render thread does the GL upload.
@@ -197,21 +200,48 @@
             if (ok) {
                 apfaSetBgColor(self->_bgColor);
                 double mb = apfaGetMemoryBytes() / 1048576.0;
+                double streamedMb = apfaGetStreamedBytes() / 1048576.0;
                 NSNumberFormatter *f = [[NSNumberFormatter alloc] init];
                 f.numberStyle = NSNumberFormatterDecimalStyle;
                 NSString *notes = [f stringFromNumber:@(apfaGetNoteCount())];
-                self->_infoLine = [NSString stringWithFormat:@"%@ notes  -  %.1f MB",
-                                   notes, mb];
+                // The streamed suffix only when there IS a pool — PlaybackActivity
+                // makes the same distinction, and for the same reason: on a MIDI
+                // that fitted in RAM the number would just read as a zero.
+                self->_infoLine = streamedMb > 0
+                    ? [NSString stringWithFormat:@"%@ notes  -  %.1f MB (%.1f MB streamed)",
+                       notes, mb, streamedMb]
+                    : [NSString stringWithFormat:@"%@ notes  -  %.1f MB", notes, mb];
                 NSLog(@"[aPFA] %@", self->_infoLine);
                 [self showPlaybackScreen];
             } else {
-                // Only 0 and 5 are reachable on iOS: 1-4 are all streaming-pool
-                // codes and the pool is not compiled into this target.
+                // Same codes as PlaybackActivity's when(), same wording where
+                // the situation is the same. 3 (FAT32's 4 GB per-file limit) and
+                // 4 (a 32-bit address space) cannot happen here — the container
+                // is APFS and the target is arm64-only — so they fall through to
+                // the default rather than claiming something impossible.
                 switch (apfaGetLoadError()) {
+                    case 1:
+                        [self fail:@"This Black MIDI likely needs Chunked Disk "
+                                    "Streaming, please enable it in Settings."];
+                        break;
+                    case 2:
+                        [self fail:@"Not enough space on iPhone to load this MIDI! "
+                                    "Please free up space!"];
+                        break;
                     case 5:
+                        [self fail:@"This MIDI is too big for this device's RAM, "
+                                    "and disk streaming isn't available for it "
+                                    "here."];
+                        break;
+                    case 6:
                         [self fail:@"This MIDI is too big for this device's RAM. "
-                                    "iOS has no swap, so a MIDI that does not fit "
-                                    "cannot be played here at all."];
+                                    "Chunked Disk Streaming moves the sort to "
+                                    "disk, but the last stage of the load still "
+                                    "has to hold a note index in RAM that cannot "
+                                    "be streamed, and this MIDI's index is bigger "
+                                    "than iOS will let this app have. Free storage "
+                                    "doesn't help — a device with more RAM will "
+                                    "load it."];
                         break;
                     default:
                         [self fail:@"Could not parse the MIDI file"];

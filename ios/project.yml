@@ -43,6 +43,8 @@ settings:
     # Metal — see the port notes on why EAGL and not Metal.
     GCC_PREPROCESSOR_DEFINITIONS:
       - "GLES_SILENCE_DEPRECATION=1"
+      # The streaming pool. See the note under `sources` for why iOS wants it.
+      - "APFA_STREAMING=1"
       - "$(inherited)"
     HEADER_SEARCH_PATHS:
       - "$(SRCROOT)/../app/src/main/cpp"
@@ -76,12 +78,17 @@ targets:
           # asks for an ES3 context by itself, so nothing is lost).
           - "renderer_es3.cpp"
           - "renderer_es3.h"
-          # The streaming pool is not compiled into iOS — APFA_STREAMING is
-          # never defined here, so engine.cpp takes the pure in-RAM parse and
-          # nothing references these. iOS has no swap: a MIDI that does not fit
-          # in RAM cannot be played on the device at all, pagefile or not.
-          - "streamer.cpp"
-          - "streamer.h"
+          # streamer.{cpp,h} used to be excluded here, on the grounds that iOS
+          # has no swap. That reasoning was wrong. The pool has never used swap:
+          # it is written to a file and then mapped PROT_READ | MAP_PRIVATE
+          # (streamer.cpp), so the pages the engine faults on are clean,
+          # read-only and file-backed — the one kind of page iOS CAN evict
+          # without a swap device, and the kind that stays out of the process's
+          # phys_footprint and so out of jetsam's arithmetic. If anything the
+          # design suits iOS better than Android, where the same pages compete
+          # with a real swap/zram pool. What it does need is a handful of Darwin
+          # shims (page size, statfs, /proc/meminfo, RUSAGE_THREAD, thread I/O
+          # policy) — all of them now inside the shared sources.
 
     dependencies:
       # Both are prebuilt xcframeworks from un4seen. They are NOT in the repo —

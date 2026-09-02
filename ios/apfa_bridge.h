@@ -20,22 +20,28 @@ extern "C" {
 #endif
 
 // Parse the MIDI and build the engine. sfPath may be "" for no soundfont (the
-// setup screen warns about that, exactly as MainActivity does). Blocking —
-// call off the main thread. Note the arguments native-lib.cpp has and this does
-// not: cpuMask (no per-core affinity on iOS — the engine thread takes
-// QOS_CLASS_USER_INTERACTIVE instead, engine.cpp), legacyRenderer (iOS always
-// gets RendererES2, which picks an ES3 context by itself), and
-// allowChunked/poolDir (the streaming pool is not compiled into the iOS target).
+// setup screen warns about that, exactly as MainActivity does). allowChunked is
+// the "Chunked Disk Streaming" setting. Blocking — call off the main thread.
+// Note the arguments native-lib.cpp has and this does not: cpuMask (no per-core
+// affinity on iOS — the engine thread takes QOS_CLASS_USER_INTERACTIVE instead,
+// engine.cpp), legacyRenderer (iOS always gets RendererES2, which picks an ES3
+// context by itself), and poolDir (empty here, which puts the pool beside the
+// MIDI — Documents/midi in the app container, the same volume it would land on
+// anyway; iOS has no removable storage to choose between).
 bool apfaLoad(const char* midiPath, const char* sfPath,
-              int voiceCount, float noteSpeed);
+              int voiceCount, float noteSpeed, bool allowChunked);
 
-// Why the last apfaLoad returned false — apfa::Engine::LoadError. On iOS only
-// 0 (generic parse failure) and 5 (too big for RAM) are reachable: 1-4 are all
-// streaming-pool codes and the pool is not built here.
+// Why the last apfaLoad returned false — apfa::Engine::LoadError. All seven
+// codes are reachable on iOS now that the streaming pool is compiled in, except
+// 3 (FAT32's per-file limit; the app container is always APFS) and 4 (a 32-bit
+// address space; the target is arm64-only).
 int      apfaGetLoadError(void);
 float    apfaGetLoadProgress(void);
 int64_t  apfaGetNoteCount(void);
 int64_t  apfaGetMemoryBytes(void);
+// Bytes of pool written to and streamed from disk for this load; 0 when the
+// plain in-RAM parse was used, which is every MIDI that fits.
+int64_t  apfaGetStreamedBytes(void);
 
 // `caeaglLayer` is the CAEAGLLayer* of the playback view, where Android passes
 // an ANativeWindow*. It must outlive the render thread — the view owns it, and

@@ -44,17 +44,17 @@ BASSMIDI_DIR  = $(ROOT)/bassmidi24-ios
 BASS_FW       = $(BASS_DIR)/bass.xcframework/ios-arm64_armv7_armv7s/bass.framework
 BASSMIDI_FW   = $(BASSMIDI_DIR)/bassmidi.xcframework/ios-arm64_armv7_armv7s/bassmidi.framework
 
-# Shared engine, MINUS the three Android-only pieces. Keep this list in lockstep
+# Shared engine, MINUS the two Android-only pieces. Keep this list in lockstep
 # with the excludes in project.yml:
 #   native-lib.cpp   JNI surface (apfa_bridge.mm replaces it)
 #   renderer_es3.*   Android-only, includes <android/*> unguarded
-#   streamer.*       streaming pool; APFA_STREAMING is never defined for iOS
 ENGINE_SRC = \
 	$(CPP_DIR)/engine.cpp \
 	$(CPP_DIR)/midi_parser.cpp \
 	$(CPP_DIR)/synth.cpp \
 	$(CPP_DIR)/renderer.cpp \
-	$(CPP_DIR)/bigalloc.cpp
+	$(CPP_DIR)/bigalloc.cpp \
+	$(CPP_DIR)/streamer.cpp
 
 IOS_MM  = eagl_surface.mm apfa_bridge.mm
 IOS_M   = main.m APFAAppDelegate.m APFAGLView.m APFAImageUtil.m \
@@ -65,7 +65,8 @@ INCLUDES = -I$(CPP_DIR) -I$(BASS_DIR) -I$(BASSMIDI_DIR) -I.
 # -O2 in every configuration, deliberately: the legit run has to reflect the
 # fastest the hardware genuinely allows, and an -O0 engine would be unfaithful.
 COMMON = -target $(TARGET) -isysroot $(SDK) $(INCLUDES) -O2 -fobjc-arc \
-         -DGLES_SILENCE_DEPRECATION=1 -fvisibility=hidden -Wall
+         -DGLES_SILENCE_DEPRECATION=1 -DAPFA_STREAMING=1 \
+         -fvisibility=hidden -Wall
 CXXFLAGS = $(COMMON) -std=c++17 -stdlib=libc++
 OBJCFLAGS = $(COMMON) -fmodules -fobjc-abi-version=2
 

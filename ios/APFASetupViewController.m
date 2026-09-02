@@ -6,9 +6,13 @@
 //                          QOS_CLASS_USER_INTERACTIVE instead (engine.cpp).
 //   • Legacy Renderer    — iOS always gets RendererES2, which asks for an ES3
 //                          context by itself and falls back on its own.
-//   • Chunked Disk       — the streaming pool is not compiled in (no
-//     Streaming /          APFA_STREAMING), so every load is the in-RAM parse.
-//     Pagefile on SD       iOS has no removable storage and no swap either way.
+//   • Pagefile on SD     — no removable storage to put it on. The pool always
+//                          goes beside the MIDI in the app container.
+//
+// "Chunked Disk Streaming" IS here: the streaming pool builds for iOS now, and
+// on iOS the toggle earns its place more than it does on Android, because the
+// un-chunked sort's RAM transient is priced against a jetsam limit that is
+// roughly half of a device's RAM rather than against the RAM itself.
 #import "APFASetupViewController.h"
 #import "APFAPlaybackViewController.h"
 
@@ -21,6 +25,7 @@ static NSString *const kPrefNoteSpeed  = @"noteSpeed";
 static NSString *const kPrefBgColor    = @"bgColor";
 static NSString *const kPrefBgImage    = @"bgImage";
 static NSString *const kPrefSoundfont  = @"soundfont";
+static NSString *const kPrefChunked    = @"chunkedStreaming";
 
 typedef NS_ENUM(NSInteger, APFAPickTarget) {
     APFAPickMidi,
@@ -41,6 +46,7 @@ typedef NS_ENUM(NSInteger, APFAPickTarget) {
     float     _noteSpeed;
     uint32_t  _bgColor;         // PFA BGR packing: R = bits 0-7, G = 8-15, B = 16-23
     NSString *_bgImagePath;
+    BOOL      _chunked;         // "Chunked Disk Streaming"
 
     APFAPickTarget _pickTarget;
 
@@ -53,6 +59,7 @@ typedef NS_ENUM(NSInteger, APFAPickTarget) {
     UISlider *_speedSlider;
     UIView   *_colorSwatch;
     UISlider *_rSlider, *_gSlider, *_bSlider;
+    UISwitch *_chunkSwitch;
     UIButton *_playButton;
 }
 
@@ -88,6 +95,7 @@ typedef NS_ENUM(NSInteger, APFAPickTarget) {
     // The soundfont is remembered across launches, like Android's. A stale path
     // (app container re-signed / reinstalled) is dropped rather than handed to
     // the engine as a file that is not there.
+    _chunked = [d boolForKey:kPrefChunked];
     NSString *sf = [d stringForKey:kPrefSoundfont];
     if (sf.length && [fm fileExistsAtPath:sf]) {
         _sfPath = sf;
@@ -102,6 +110,7 @@ typedef NS_ENUM(NSInteger, APFAPickTarget) {
     [d setInteger:(NSInteger)_bgColor forKey:kPrefBgColor];
     [d setObject:(_bgImagePath ?: @"") forKey:kPrefBgImage];
     [d setObject:(_sfPath ?: @"")      forKey:kPrefSoundfont];
+    [d setBool:_chunked forKey:kPrefChunked];
     [d synchronize];
 }
 
@@ -236,6 +245,62 @@ static int progressFromSpeed(float s) {
     [imgRow addArrangedSubview:[self buttonTitled:@"Clear"
                                            action:@selector(clearBgImage)]];
     [right addArrangedSubview:imgRow];
+
+    // MainActivity buries this behind an "Advanced Settings" dialog. There is no
+    // such dialog here and the column has the room, so it sits in the open — but
+    // it keeps the same confirmation, because the warning is what matters.
+    UIStackView *chunkRow = [[UIStackView alloc] init];
+    chunkRow.axis      = UILayoutConstraintAxisHorizontal;
+    chunkRow.spacing   = 8;
+    chunkRow.alignment = UIStackViewAlignmentCenter;
+    UILabel *chunkLabel = [self label:@"Chunked Disk Streaming"];
+    chunkLabel.font = [UIFont systemFontOfSize:14];
+    _chunkSwitch = [[UISwitch alloc] init];
+    _chunkSwitch.on = _chunked;
+    [_chunkSwitch addTarget:self action:@selector(chunkedChanged)
+           forControlEvents:UIControlEventValueChanged];
+    [_chunkSwitch setContentHuggingPriority:UILayoutPriorityRequired
+                                    forAxis:UILayoutConstraintAxisHorizontal];
+    [chunkRow addArrangedSubview:chunkLabel];
+    [chunkRow addArrangedSubview:_chunkSwitch];
+    [right addArrangedSubview:chunkRow];
+}
+
+// Turning it ON asks first; turning it off is just off. Same shape as
+// MainActivity's checkbox listener, same words, minus the 32-bit paragraph —
+// this target is arm64-only, so the pagefile is never split into 2 GB pieces.
+- (void)chunkedChanged {
+    if (!_chunkSwitch.on) {
+        _chunked = NO;
+        [self saveSettings];
+        return;
+    }
+    UIAlertController *a = [UIAlertController
+        alertControllerWithTitle:@"Chunked Disk Streaming"
+                         message:@"Sorts a huge MIDI's pagefile in chunks on "
+                                  "disk instead of in RAM, so Black MIDIs too "
+                                  "big for normal disk streaming can load, the "
+                                  "only limit is your free storage.\n\n"
+                                  "WARNING: loading such MIDIs can take VERY "
+                                  "large amounts of storage, stability issues "
+                                  "may occur, and loading times could be very "
+                                  "long.\n\n"
+                                  "Are you sure you want to enable this?"
+                  preferredStyle:UIAlertControllerStyleAlert];
+    [a addAction:[UIAlertAction actionWithTitle:@"Yes"
+                                          style:UIAlertActionStyleDefault
+                                        handler:^(UIAlertAction *action) {
+        self->_chunked = YES;
+        [self saveSettings];
+    }]];
+    [a addAction:[UIAlertAction actionWithTitle:@"No"
+                                          style:UIAlertActionStyleCancel
+                                        handler:^(UIAlertAction *action) {
+        self->_chunked = NO;
+        self->_chunkSwitch.on = NO;
+        [self saveSettings];
+    }]];
+    [self presentViewController:a animated:YES completion:nil];
 }
 
 - (UIStackView *)column {
@@ -447,7 +512,8 @@ didFinishPickingMediaWithInfo:(NSDictionary<UIImagePickerControllerInfoKey, id> 
                                                  voiceCount:_voiceCount
                                                   noteSpeed:_noteSpeed
                                                     bgColor:_bgColor
-                                                bgImagePath:_bgImagePath];
+                                                bgImagePath:_bgImagePath
+                                           chunkedStreaming:_chunked];
     [self.navigationController pushViewController:vc animated:YES];
 }
 

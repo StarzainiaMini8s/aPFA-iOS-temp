@@ -18,10 +18,11 @@ shell.
 | `APFAImageUtil.m` | `applyBgImage` | decode a background image to packed RGBA |
 | `APFAAppDelegate.m`, `main.m` | the manifest's launcher activity | window + root controller |
 
-**Status: never compiled.** Everything here was written without a Mac. The
-signatures are checked against the real `engine.h` and `eagl_surface.h`, and the
-shared engine syntax-checks in both configurations, but the first real build is
-the verification step. Expect to fix things.
+**Status: built and run.** The macOS runner produces the `.ipa`, and it has
+played `9KX2 18 Million Notes.mid` end to end on an A19 Pro — 18 M notes, in
+RAM, no streaming pool involved. What has *not* run on a device is everything
+added with the streaming pool below: it compiles into the target now, but no
+iOS load has yet been big enough to take that path in front of anyone.
 
 ---
 
@@ -106,12 +107,44 @@ is not achieving. Slowing down under load is the product, not a bug; this line i
 what preserves it. **Verify it on-device**, against an Android run of the same
 MIDI at the same settings.
 
-**No streaming pool.** `APFA_STREAMING` is never defined for this target, so
-every load is the pure in-RAM parse and `streamer.{cpp,h}` are excluded from the
-build. iOS has no swap: a MIDI that does not fit in RAM cannot be played, and
-there is no pagefile to fall back on. The 5S's ~1 GB RAM is the real ceiling
-(~3–4M notes); bigger Black MIDIs get jetsam-killed during load rather than
-slowing down.
+**The streaming pool, and why iOS suits it.** `APFA_STREAMING` *is* defined for
+this target. It used to be excluded on the grounds that "iOS has no swap", and
+that reasoning was simply wrong: the pool has never used swap. It is written to
+a file and then mapped `PROT_READ | MAP_PRIVATE`, so every page the engine
+faults on is clean, read-only and file-backed — the one kind of page iOS can
+evict *without* a swap device, and the kind that stays out of `phys_footprint`
+and therefore out of jetsam's arithmetic. The design is a better fit here than
+on Android, where the same pages compete with zram.
+
+Without it the ceiling is the in-RAM parse: 72 B per `PlayEvent`, two events per
+note, plus two 8 B `events[]` pointers = **160 B/note**, against a jetsam limit
+near half of RAM. That is ~20 M notes on a 12 GB iPhone (the reported ceiling
+from the field) and ~3–4 M on a 5S, and past it the app is killed mid-load with
+no message rather than slowing down.
+
+Five Darwin shims make the shared streamer build here, all of them inside the
+shared sources:
+
+| Linux thing | Darwin | Why it matters |
+|---|---|---|
+| `kPageSize = 4096` | `16384` on `__APPLE__` | arm64 kernels use 16 KB pages. At 4096 `kSegGrain` is 36864, not a multiple of 16384, and the first mapping at a pool-file boundary fails `EINVAL` several GB into the load. Rounding up is safe either way; `Streamer::open` re-checks against `sysconf` and refuses cleanly if it is ever wrong. |
+| `<sys/statfs.h>` | `<sys/param.h>` + `<sys/mount.h>` | the header does not exist; and `f_type` is Darwin's own numbering, so the FAT32 guard compares `f_fstypename` instead |
+| `/proc/meminfo` | `os_proc_available_memory()` | there is no `/proc`, and no system-wide "available" worth having — the loader's window has to be priced against what *this process* may still touch. Weakly imported for the iOS 12 floor, with a footprint-based estimate behind it. |
+| `RUSAGE_THREAD` | — | Darwin has only `RUSAGE_SELF`; the loader's fault counter stays 0 rather than reporting the whole process |
+| `QOS_CLASS_UTILITY` for the loader | `USER_INITIATED` + `IOPOL_IMPORTANT` | Darwin ties I/O priority to QoS, and UTILITY is disk-throttled. Throttling the read-ahead thread defeats the pool. |
+
+The adaptive gate changes basis too. On Android it prices the predicted parse
+against 40% of physical RAM; on iOS physical RAM is the wrong number entirely —
+jetsam kills at a per-process footprint limit near half of it — so the budget is
+70% of `os_proc_available_memory()`, measured before the parse allocates
+anything. `Engine::load` logs both numbers once per load.
+
+**Chunked Disk Streaming is in the setup screen.** MainActivity buries it in an
+"Advanced Settings" dialog; here it is a switch in the settings column, with the
+same confirmation text minus the 32-bit paragraph (this target is arm64-only, so
+the pagefile is never split into 2 GB pieces). It matters more on iOS than on
+Android: the un-chunked sort's RAM transient is priced against that same jetsam
+limit, so the un-chunked ceiling arrives sooner here.
 
 **No core pinning.** iOS exposes no `sched_setaffinity`. `engine.cpp` takes the
 `__APPLE__` branch and puts the engine thread on `QOS_CLASS_USER_INTERACTIVE`

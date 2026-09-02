@@ -12,6 +12,7 @@
                       voiceCount:(int)voiceCount
                        noteSpeed:(float)noteSpeed
                          bgColor:(uint32_t)bgrColor
-                    bgImagePath:(NSString *)bgImagePath;
+                    bgImagePath:(NSString *)bgImagePath
+               chunkedStreaming:(BOOL)chunkedStreaming;
 
 @end
