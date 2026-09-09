@@ -364,6 +364,12 @@ MidiData parseMidi(const std::string& path, std::atomic<float>& progress,
     progress    = 1.0f;
 
     munmap(map, fileSize);
+    // The one way out of here that reports failure without a reason. It has to
+    // say something: on iOS the UI quotes the last error line when the load
+    // error code has no message of its own, and silence there would leave the
+    // previous load's error standing (see platform.h logLastError).
+    if (!out.valid)
+        LOGE("parseMidi: %s has a valid header but no events", path.c_str());
     LOGI("parseMidi: %zu notes (%zu events), %d tracks, %.1f s, %.1f MB",
          out.noteCount(), out.eventPool.size(), out.trackCount,
          out.totalUs / 1e6, out.memoryBytes() / 1048576.0);

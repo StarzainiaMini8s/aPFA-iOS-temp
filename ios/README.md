@@ -83,6 +83,57 @@ MIDIs and soundfonts go in the app's folder: **Files → On My iPhone → aPFA**
 over USB in Finder. The setup screen's picker works too — it copies the file into
 the app container either way.
 
+### Reading the log without a Mac
+
+`LOGI`/`LOGE` used to go only to stdout/stderr, and on iOS **that is /dev/null
+unless a debugger is attached** — an app launched normally has no stdout anyone
+can read, so even Console.app on a Mac shows nothing. Every line now goes to two
+places that do not need a Mac at all (`platform.h`, Apple branch):
+
+**1. A file on the phone.** `Documents/apfa-log.txt`, which the existing
+`UIFileSharingEnabled` publishes as **Files → On My iPhone → aPFA →
+`apfa-log.txt`**, beside the `midi/` and `soundfonts/` folders. The path is set
+in `APFAAppDelegate` at launch.
+
+- One file per run, headed `==== aPFA launched <date> ====`, and the previous
+  run is renamed to **`apfa-log-prev.txt`** rather than overwritten. That rename
+  is the point: the load worth reading is usually the one that ended in a jetsam
+  kill — no alert, no error code, the process simply gone — and the natural next
+  move is to relaunch and try again, which would otherwise truncate exactly that
+  log. **After a crash, read `-prev`.**
+- Every line is flushed as written, so the file survives a kill mid-load.
+- Capped at 1 MB per run; on overflow it stops appending rather than wrapping,
+  because the load at the top is the part worth keeping and the 2 Hz `perf:`
+  lines are only what makes it big.
+
+**2. The device syslog**, via `os_log` (iOS 10; the 12.0 floor makes it a plain
+strong link, no `dlsym` care needed — unlike `os_proc_available_memory`). This
+is the one a **Windows** machine can reach over USB:
+
+- **3uTools** → Toolbox → *Real-time Log* — a GUI, filter on `aPFA`.
+- **`idevicesyslog.exe`** from libimobiledevice-win — `idevicesyslog | findstr
+  aPFA`, the closest thing to `adb logcat` here.
+
+Both also show the OS's own `Jetsam`/`memorystatus` entries, which is how you
+tell an out-of-memory kill apart from a clean refusal — the app cannot log its
+own death. Note `%{public}s` in `logPrint`: without that annotation the unified
+log redacts every dynamic string to `<private>` and the reader gets empty lines.
+
+A load that refuses with an error code the UI has no message for also **quotes
+the last `LOGE` line in the alert itself**, so the common case needs neither.
+
+For a load being investigated the lines that matter are
+`memory: … GB RAM, … GB headroom before jetsam` and whichever of
+`predicted in-RAM footprint …` / `previous load of this MIDI died` decided the
+mode.
+
+### Getting the file off the phone onto Windows
+
+Not needed to *read* it — Files.app previews `.txt` on the phone, and Share →
+any chat app sends it. To pull it over USB: **Apple Devices** (Windows 11) or
+**iTunes** (Windows 10) → the device → *Files* / *File Sharing* → **aPFA** →
+drag `apfa-log.txt` out. **3uTools** and **iMazing** browse the same container.
+
 ---
 
 ## Design decisions worth knowing

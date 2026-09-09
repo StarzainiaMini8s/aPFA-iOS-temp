@@ -21,8 +21,17 @@ std::string cstr(const char* s) { return s ? std::string(s) : std::string(); }
 
 extern "C" {
 
+void apfaSetLogPath(const char* path) {
+    apfa::platform::logSetPath(path);
+}
+
+const char* apfaLastLogError(void) {
+    return apfa::platform::logLastError();
+}
+
 bool apfaLoad(const char* midiPath, const char* sfPath,
               int voiceCount, float noteSpeed, bool allowChunked) {
+    apfa::platform::logClearLastError();   // this load's errors only
     apfa::Engine* old = g_engine.exchange(nullptr);
     if (old) { old->stop(); delete old; }
 

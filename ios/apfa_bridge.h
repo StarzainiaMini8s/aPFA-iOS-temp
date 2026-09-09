@@ -19,6 +19,20 @@
 extern "C" {
 #endif
 
+// Point the shared engine's LOGI/LOGE at a file (see platform.h). Call once,
+// before anything else, with a path inside Documents: UIFileSharingEnabled
+// publishes that folder as "On My iPhone -> aPFA", so the log is readable on
+// the phone itself. This exists because a sideloaded build has no reachable
+// console — stdout/stderr need a Mac with Xcode attached, and the people this
+// port is for do not have one. Truncates: one file per run.
+void        apfaSetLogPath(const char* path);
+
+// The most recent LOGE line, "" if there has not been one. What the "Can't load
+// this MIDI" alert quotes when the load error code has no message of its own —
+// without it, a refusal the UI does not recognise is indistinguishable from a
+// corrupt file. Valid until the next log line; copy it if you keep it.
+const char* apfaLastLogError(void);
+
 // Parse the MIDI and build the engine. sfPath may be "" for no soundfont (the
 // setup screen warns about that, exactly as MainActivity does). allowChunked is
 // the "Chunked Disk Streaming" setting. Blocking — call off the main thread.

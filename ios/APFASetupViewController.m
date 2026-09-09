@@ -67,7 +67,20 @@ typedef NS_ENUM(NSInteger, APFAPickTarget) {
 
 - (void)viewDidLoad {
     [super viewDidLoad];
-    self.title = @"aPFA";
+    // The iOS build says so on its face. CFBundleDisplayName stays "aPFA"
+    // (the home-screen label truncates at roughly a dozen characters, so a
+    // longer one would read as "aPFA (for..."), and the playback bar keeps
+    // the short form because it doubles as the back chevron's label in a
+    // 60 pt slot. This screen is where there is room to say it.
+    self.title = @"aPFA (for iOS)";
+    // UINavigationController builds the playback screen's back button out of
+    // THIS title, so without an override the chevron would read
+    // "< aPFA (for iOS)" and eat the left third of a 4-inch landscape bar.
+    self.navigationItem.backBarButtonItem =
+        [[UIBarButtonItem alloc] initWithTitle:@"aPFA"
+                                         style:UIBarButtonItemStylePlain
+                                        target:nil
+                                        action:nil];
     self.view.backgroundColor = [UIColor colorWithRed:18/255.0 green:18/255.0
                                                  blue:24/255.0 alpha:1.0];
     _voiceCount = 250;

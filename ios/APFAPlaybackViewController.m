@@ -215,10 +215,22 @@
                 [self showPlaybackScreen];
             } else {
                 // Same codes as PlaybackActivity's when(), same wording where
-                // the situation is the same. 3 (FAT32's 4 GB per-file limit) and
-                // 4 (a 32-bit address space) cannot happen here — the container
-                // is APFS and the target is arm64-only — so they fall through to
-                // the default rather than claiming something impossible.
+                // the situation is the same — but NOT the same set of causes,
+                // and the difference is what used to make this screen unhelpful.
+                //
+                // Code 4 was written off here as "a 32-bit address space, which
+                // an arm64-only target cannot have". That is only half of what
+                // sets it: Engine::load also sets kLoadNoAddrSpace from its
+                // catch(std::bad_alloc) around the streaming parse, which on
+                // iOS is an ordinary out-of-memory — the single most likely way
+                // for a big MIDI to fail on this platform. It was landing in
+                // the default arm and reporting "Could not parse the MIDI
+                // file", i.e. blaming the file for the phone running out of
+                // room. It has its own message now.
+                //
+                // Code 3 (FAT32's 4 GB per-file limit) genuinely cannot happen
+                // on an APFS container, but it costs one line to say so
+                // truthfully rather than mislabel it if it ever does.
                 switch (apfaGetLoadError()) {
                     case 1:
                         [self fail:@"This Black MIDI likely needs Chunked Disk "
@@ -227,6 +239,22 @@
                     case 2:
                         [self fail:@"Not enough space on iPhone to load this MIDI! "
                                     "Please free up space!"];
+                        break;
+                    case 3:
+                        [self fail:@"This MIDI's pagefile is over the volume's "
+                                    "4 GB per-file limit. That should not be "
+                                    "possible inside the app's own storage — "
+                                    "please report it."];
+                        break;
+                    case 4:
+                        [self fail:@"Ran out of memory building the disk "
+                                    "streaming pool for this MIDI. iOS caps how "
+                                    "much memory one app may hold — well under "
+                                    "the amount the device has — and this load "
+                                    "asked for more than was left. Turning on "
+                                    "Chunked Disk Streaming moves the biggest "
+                                    "part of that to disk; if it is already on, "
+                                    "this MIDI needs a device with more RAM."];
                         break;
                     case 5:
                         [self fail:@"This MIDI is too big for this device's RAM, "
@@ -243,9 +271,26 @@
                                     "doesn't help — a device with more RAM will "
                                     "load it."];
                         break;
-                    default:
-                        [self fail:@"Could not parse the MIDI file"];
+                    default: {
+                        // Everything that refuses without a code of its own —
+                        // a malformed file, but also the streamer's own
+                        // refusals (page size, temp file, unusable event
+                        // count). Those all LOGE a specific reason on the way
+                        // out, and on a sideloaded build that log is otherwise
+                        // unreachable: there is no console here without a Mac.
+                        // So quote the last error line into the alert, and say
+                        // where the rest of it lives.
+                        const char *why = apfaLastLogError();
+                        NSString *detail =
+                            (why && why[0]) ? @(why) : nil;
+                        [self fail:(detail
+                            ? [NSString stringWithFormat:
+                                @"Could not parse the MIDI file.\n\n%@\n\n"
+                                 "Full log: Files -> On My iPhone -> aPFA -> "
+                                 "apfa-log.txt", detail]
+                            : @"Could not parse the MIDI file")];
                         break;
+                    }
                 }
             }
         });

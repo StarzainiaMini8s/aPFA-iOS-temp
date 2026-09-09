@@ -13,10 +13,21 @@
   #include <android/log.h>
   #define LOGI(...) __android_log_print(ANDROID_LOG_INFO,  "aPFA", __VA_ARGS__)
   #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, "aPFA", __VA_ARGS__)
+#elif defined(__APPLE__)
+  // stdout/stderr are a dead end on a SIDELOADED iOS build: reading them needs
+  // a Mac with Xcode or Console.app attached over USB, and the people this port
+  // is built for do not have one. A load that refuses therefore has to leave
+  // its reason somewhere the phone itself can show — so every line also goes to
+  // a plain text file in the app's Documents folder, which UIFileSharingEnabled
+  // publishes as "On My iPhone -> aPFA -> apfa-log.txt", and the last error line
+  // is kept in memory for the failure alert to quote (see logLastError below).
+  // Definitions are in the __APPLE__ block at the bottom of this header.
+  #define LOGI(...) ::apfa::platform::logPrint('I', __VA_ARGS__)
+  #define LOGE(...) ::apfa::platform::logPrint('E', __VA_ARGS__)
 #else
   #include <cstdio>
   // All aPFA LOG call sites pass a string-literal format first, so the literal
-  // concatenation below is well-formed. Shows up in the Xcode device console.
+  // concatenation below is well-formed.
   #define LOGI(...) do { fprintf(stdout, "[aPFA] " __VA_ARGS__); fputc('\n', stdout); } while (0)
   #define LOGE(...) do { fprintf(stderr, "[aPFA] " __VA_ARGS__); fputc('\n', stderr); } while (0)
 #endif
@@ -32,11 +43,139 @@
   #include <sys/sysctl.h>     // hw.memsize
   #include <mach/mach.h>      // task_info / phys_footprint
   #include <dlfcn.h>          // os_proc_available_memory, looked up at runtime
+  #include <cstdarg>
   #include <cstddef>
   #include <cstdint>
+  #include <cstdio>
+  #include <cstring>
+  #include <ctime>
+  #include <mutex>
+  #include <os/log.h>       // device syslog; reachable from Windows over USB
+  #include <string>
 
 namespace apfa {
 namespace platform {
+
+// ---- logging (see the LOGI/LOGE macros at the top of this header) -----------
+//
+// Everything here is header-only `inline` with function-local statics on
+// purpose: the alternative is a new .cpp, which would have to be added to
+// ios/project.yml, ios/Makefile AND the CI workflow's source list in lockstep,
+// and this is not worth three places that can drift.
+
+// Size cap for ONE run's file (the previous run is kept whole, see logSetPath).
+// On overflow we stop appending rather than wrapping, because the interesting
+// part of any aPFA log is the load at the top — the 2 Hz "perf:" lines that
+// follow are what makes it big, and losing the load to keep those would be
+// exactly backwards.
+constexpr long   kLogMaxBytes    = 1L << 20;   // 1 MB
+constexpr size_t kLogLastErrMax  = 512;
+
+inline std::mutex& logMutex()   { static std::mutex m; return m; }
+inline std::string& logPath()   { static std::string p; return p; }
+inline char* logLastErrBuf()    { static char b[kLogLastErrMax] = {0}; return b; }
+inline bool& logOverflowed()    { static bool o = false; return o; }
+
+inline FILE*& logStream() { static FILE* f = nullptr; return f; }
+
+// Called once at launch from the app delegate, with a path inside Documents.
+//
+// One log per run, but the PREVIOUS run is renamed aside rather than
+// overwritten, and that is the whole point of the rename. The load worth
+// reading is usually the one that ended in a jetsam kill: no alert, no error
+// code, the process simply gone. Every line is flushed as it is written so that
+// log survives the kill — and then the completely natural next move is to open
+// the app again and try, which with a plain "w" would truncate the one file
+// that had the answer in it. Whoever reads this wants -prev far more often than
+// they want the run in which they went looking.
+inline void logSetPath(const char* path) {
+    std::lock_guard<std::mutex> lk(logMutex());
+    if (logStream() != nullptr) { fclose(logStream()); logStream() = nullptr; }
+    logOverflowed() = false;
+    logPath() = path ? path : "";
+    if (logPath().empty()) return;
+
+    const size_t dot = logPath().find_last_of('.');
+    const std::string prev =
+        (dot == std::string::npos ? logPath() : logPath().substr(0, dot)) +
+        "-prev.txt";
+    rename(logPath().c_str(), prev.c_str());   // silently no-ops on the first run
+
+    logStream() = fopen(logPath().c_str(), "w");
+    if (logStream() == nullptr) return;
+    // Date the file: the reader is matching it against "the time I pressed
+    // Play", possibly days later and over a chat app.
+    char when[64] = "";
+    time_t    t = time(nullptr);
+    struct tm tmv;
+    if (localtime_r(&t, &tmv) != nullptr)
+        strftime(when, sizeof(when), "%Y-%m-%d %H:%M:%S", &tmv);
+    fprintf(logStream(), "==== aPFA launched %s ====\n", when);
+    fflush(logStream());
+}
+
+// The most recent LOGE line, "" if there has not been one. The failure alert
+// quotes this: on a platform with no reachable console, a load that refuses for
+// a reason the UI has no code for must still be able to say what happened.
+inline const char* logLastError() { return logLastErrBuf(); }
+
+// Call at the top of a load. Without it the failure alert can quote an error
+// from a PREVIOUS attempt — the file stays, but "the last thing that went
+// wrong" has to mean "in this load" for the alert to be worth showing.
+inline void logClearLastError() {
+    std::lock_guard<std::mutex> lk(logMutex());
+    logLastErrBuf()[0] = '\0';
+}
+
+__attribute__((format(printf, 2, 3)))
+inline void logPrint(char level, const char* fmt, ...) {
+    char line[1024];
+    va_list ap;
+    va_start(ap, fmt);
+    const int n = vsnprintf(line, sizeof(line), fmt, ap);
+    va_end(ap);
+    if (n < 0) return;
+
+    // stdout/stderr reach a debugger and NOTHING else: an app launched normally
+    // on iOS — which is every sideloaded launch — has them pointed at /dev/null,
+    // so this line is for an Xcode session and no other reader.
+    fprintf(level == 'E' ? stderr : stdout, "[aPFA] %s\n", line);
+
+    // The device syslog is the reader that matters, because it is the one a
+    // WINDOWS machine can reach: 3uTools' real-time log, or idevicesyslog from
+    // libimobiledevice, both pull this over USB with no Mac anywhere. os_log is
+    // iOS 10 and aPFA's floor is 12.0, so this links strongly and needs none of
+    // the dlsym care that os_proc_available_memory does below. %{public}s is
+    // load-bearing: without the annotation the unified log redacts every
+    // dynamic string to <private> and the reader gets empty lines.
+    if (level == 'E')
+        os_log_with_type(OS_LOG_DEFAULT, OS_LOG_TYPE_ERROR, "[aPFA] %{public}s", line);
+    else
+        os_log_with_type(OS_LOG_DEFAULT, OS_LOG_TYPE_DEFAULT, "[aPFA] %{public}s", line);
+
+    std::lock_guard<std::mutex> lk(logMutex());
+    if (level == 'E') {
+        std::strncpy(logLastErrBuf(), line, kLogLastErrMax - 1);
+        logLastErrBuf()[kLogLastErrMax - 1] = '\0';
+    }
+    FILE* f = logStream();
+    if (f == nullptr || logOverflowed()) return;
+
+    char stamp[16] = "--:--:--";
+    time_t     t  = time(nullptr);
+    struct tm  tmv;
+    if (localtime_r(&t, &tmv) != nullptr)
+        strftime(stamp, sizeof(stamp), "%H:%M:%S", &tmv);
+    fprintf(f, "%s %c %s\n", stamp, level, line);
+    fflush(f);
+
+    if (ftell(f) > kLogMaxBytes) {
+        fprintf(f, "%s I --- log full (%ld bytes); nothing further is recorded, "
+                   "the load above is what matters ---\n", stamp, kLogMaxBytes);
+        fflush(f);
+        logOverflowed() = true;
+    }
+}
 
 // Call from inside the engine thread: request the performance cluster.
 inline void setEngineThreadPolicy() {
