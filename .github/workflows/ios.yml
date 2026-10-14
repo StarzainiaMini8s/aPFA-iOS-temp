@@ -61,6 +61,22 @@ jobs:
           set -euo pipefail
           APP=$(find build/Build/Products/Release-iphoneos -maxdepth 1 -name '*.app' | head -1)
           echo "Packaging $APP"
+          # un4seen's device frameworks are fat armv7 + armv7s + arm64, and
+          # Xcode embeds them as-is: ARCHS=arm64 governs what WE compile, not
+          # what a prebuilt framework carries. The 32-bit slices can never run
+          # here (iOS 12 floor; the last armv7 iPhone stops at iOS 10), and
+          # Sideloadly has refused to sign the fat bassmidi with
+          # "macho sign/edit failed (-18)". Ship arm64 only, like the main
+          # binary, so the signer sees the same thin Mach-O shape for all three.
+          for fw in "$APP"/Frameworks/*.framework; do
+            bin="$fw/$(basename "$fw" .framework)"
+            if [ "$(lipo -archs "$bin")" != "arm64" ]; then
+              lipo "$bin" -thin arm64 -output "$bin.thin"
+              mv "$bin.thin" "$bin"
+            fi
+            echo "$bin: $(lipo -archs "$bin")"
+            test "$(lipo -archs "$bin")" = "arm64"
+          done
           mkdir -p Payload
           cp -R "$APP" Payload/
           zip -qry aPFA-unsigned.ipa Payload

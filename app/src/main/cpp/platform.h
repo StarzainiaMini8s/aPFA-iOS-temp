@@ -249,6 +249,73 @@ inline uint64_t availableMemoryBytes() {
     return limit > used ? limit - used : 0;
 }
 
+// iOS has no swap, full stop — the same fact that caps a single VA reservation
+// near physical RAM (see kFatBuildCanSlice in streamer.cpp). The Android
+// counterpart below prices the chunked merge's events[] against
+// availableMemoryBytes() + swapFreeBytes(), because zram gives that table
+// somewhere to go; here there is nowhere, so the anon-commit gate must fall
+// back to availableMemoryBytes() alone. Always 0, never "could not tell".
+inline uint64_t swapFreeBytes() { return 0; }
+
 }  // namespace platform
 }  // namespace apfa
 #endif  // __APPLE__
+
+// ---- memory budget (Android / Linux) ---------------------------------------
+#if !defined(__APPLE__)
+  #include <cstdint>
+  #include <cstdio>
+  #include <cstdlib>
+  #include <cstring>
+
+namespace apfa {
+namespace platform {
+
+// What the device can still hand out without reclaiming something it will miss.
+// The counterpart to the iOS version above, and it exists for the same reason:
+// a "will this fit" question answered against TOTAL RAM is answered against the
+// wrong number. 40% of an 8 GB phone clears a 2.9 GB budget on a device that
+// only had 1.9 GB left to give, and the load dies to lmkd holding it.
+//
+// MemAvailable, not MemFree: it is the kernel's own estimate of what a new
+// allocation can have, page cache it is willing to drop included, which is
+// exactly the question being asked.
+//
+// SwapFree is deliberately NOT added. Android's swap is zram — RAM backing a
+// compressed block device — so free swap is not capacity on top of MemAvailable,
+// it is the same RAM counted twice. Adding it inflates the budget by whatever
+// the compressor happens to be holding and lands the load right back where this
+// gate exists to stop it.
+//
+// 0 means "could not tell" (no /proc/meminfo, or a kernel too old for the
+// field). Callers must treat 0 as "do not refuse", never as "no memory".
+inline uint64_t meminfoField(const char* name) {
+    FILE* f = fopen("/proc/meminfo", "r");
+    if (f == nullptr) return 0;
+    const size_t n = strlen(name);
+    char     line[256];
+    uint64_t kb = 0;
+    while (fgets(line, sizeof(line), f) != nullptr) {
+        if (strncmp(line, name, n) == 0 && line[n] == ':') {
+            kb = strtoull(line + n + 1, nullptr, 10);
+            break;
+        }
+    }
+    fclose(f);
+    return kb * 1024;
+}
+
+inline uint64_t availableMemoryBytes() { return meminfoField("MemAvailable"); }
+
+// Free swap. Unlike availableMemoryBytes() this is NOT capacity for anything
+// hit at random — a table that lives here is a major fault per access and the
+// load dies of thrash long before it dies of OOM. It is capacity for exactly
+// one thing: a table written straight through by position, whose pages leave as
+// clean sequential runs. events[] in the chunked merge is that table, and on
+// Android it compresses well in zram besides (it is a run of pool pointers).
+// Price anything else against availableMemoryBytes() alone.
+inline uint64_t swapFreeBytes() { return meminfoField("SwapFree"); }
+
+}  // namespace platform
+}  // namespace apfa
+#endif  // !__APPLE__

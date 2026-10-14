@@ -295,15 +295,16 @@ MidiData parseMidi(const std::string& path, std::atomic<float>& progress,
 
     // ---- time-sorted pointer table (the playback walk order) ----
     progress = 0.74f;
-    out.events.resize(poolN);
-    for (size_t i = 0; i < poolN; i++) out.events[i] = &out.eventPool[i];
+    out.eventsOwned.resize(poolN);
+    for (size_t i = 0; i < poolN; i++) out.eventsOwned[i] = &out.eventPool[i];
+    out.events = { out.eventsOwned.data(), out.eventsOwned.size() };
     progress = 0.80f;
     // PFA Z-order: events are merged track-by-track with a min-heap that breaks ties
     // by lowest track index first. This means track 0 events come first in the sorted
     // list and are drawn first (underneath); the highest-numbered track is drawn last
     // (on top). Within the same track and timestamp, preserve original parse order
     // (pointer comparison works because all events are contiguous in eventPool).
-    std::stable_sort(out.events.begin(), out.events.end(),
+    std::stable_sort(out.eventsOwned.begin(), out.eventsOwned.end(),
               [](const PlayEvent* a, const PlayEvent* b) {
                   if (a->absMicroSec != b->absMicroSec)
                       return a->absMicroSec < b->absMicroSec;

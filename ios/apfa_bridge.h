@@ -35,7 +35,7 @@ const char* apfaLastLogError(void);
 
 // Parse the MIDI and build the engine. sfPath may be "" for no soundfont (the
 // setup screen warns about that, exactly as MainActivity does). allowChunked is
-// the "Chunked Disk Streaming" setting. Blocking — call off the main thread.
+// the "Chunked Disk Paging" setting. Blocking — call off the main thread.
 // Note the arguments native-lib.cpp has and this does not: cpuMask (no per-core
 // affinity on iOS — the engine thread takes QOS_CLASS_USER_INTERACTIVE instead,
 // engine.cpp), legacyRenderer (iOS always gets RendererES2, which picks an ES3

@@ -93,6 +93,30 @@ static constexpr double kStreamHeadroomFraction = 0.70;
 static constexpr double kStreamRamFraction = 0.40;
 #endif
 
+// Fraction of the memory the device can STILL give (not of what it has) that a
+// streaming load's un-evictable tables may occupy. What it holds back is the
+// renderer, BASS, the pool's own page cache and the rest of the system's churn
+// during a load that runs for minutes.
+//
+// This is a separate question from the two fractions above, which choose a MODE
+// — in-RAM vs streaming, un-chunked vs chunked sort — and are deliberately
+// measured against total RAM so that choice is a property of the device and not
+// of whatever happened to be running when the user pressed play. This one asks
+// whether the mode that was chosen can run right now. Tuning it does not move
+// RDR 40M or NoK 90M between modes; it only changes how close to the wall a
+// load is allowed to start.
+static constexpr double kResidentAvailableFraction = 0.80;
+
+// The same question for the total anonymous commit, against RAM + free swap.
+// Lower than the fraction above because what this one holds back is not just
+// the app's other allocations but the pool's page cache: the merge is streaming
+// tens of GB of pool through it, and a load that leaves no room to cache any of
+// it makes progress at random-read speed and stays at maximum memory pressure
+// until lmkd fires. Calibrated on measured loads, S22 Ultra (7.1 GB + 4 GB zram)
+// — a ~100M-note MIDI commits ~2.5 GB and loads; Toilet Story 3 commits 5.3 GB
+// and was reaped twice, after the launcher, the keyboard and 25 other processes.
+static constexpr double kAnonCommitFraction = 0.70;
+
 // Peak non-pool cost of an UN-chunked streaming parse, per event. The sort
 // keys and pairs are the transient the name refers to, but they are not the
 // whole bill: events[] and sisterPos_ live for the entire session and inv[]
@@ -103,7 +127,7 @@ static constexpr double kStreamRamFraction = 0.40;
 //
 // Re-check against the two reference loads before touching this: RDR 40M
 // (80M events) stays un-chunked on an 8 GB phone, NoK 90M still selects the
-// chunked on-disk sort ("Chunked Disk Streaming").
+// chunked on-disk sort ("Chunked Disk Paging").
 static constexpr uint64_t kSortTransientPerEvent =
       16                       // SortKey{uint64 key, uint32 idx}, one per event
     + 4                        // Pair{uint32,uint32}, one per note = ~4 B/event
@@ -151,19 +175,43 @@ static uint64_t midiFingerprint(const std::string& midiPath) {
     return h ? h : 1;
 }
 
-static bool markerMatches(const std::string& path, uint64_t fp) {
+// The marker is how aPFA LEARNS from a kill. It survives an lmkd reap (nothing
+// gets to run on the way down), so finding one for this same MIDI is proof that
+// the last attempt did not merely fail — it was killed holding too much.
+//
+// It carries a rung as well as a fingerprint. Rung 0 is the ordinary load; each
+// kill comes back one rung higher, and a higher rung tells the streamer to keep
+// less resident (smaller inv[] window, shorter read-ahead horizon, smaller merge
+// buffers — see Streamer::setPressureRung). So a MIDI that is too big for this
+// device THIS TIME chunks itself harder on the next attempt instead of dying the
+// same way forever.
+//
+// It never changes WHAT is loaded or how it is laid out — only how much of it is
+// allowed to be resident at once. The pool, PlayEvent and the events[] walk are
+// untouched at every rung, which is the whole point: see note.h.
+static constexpr uint32_t kMaxPressureRung = 4;
+
+// -1 = no marker for this MIDI (a clean first attempt). >= 0 = the rung the
+// attempt that died was using, so the caller runs at rung + 1.
+static int markerRung(const std::string& path, uint64_t fp) {
     FILE* f = fopen(path.c_str(), "rb");
-    if (!f) return false;
+    if (!f) return -1;
     uint64_t stored = 0;
-    size_t got = fread(&stored, 1, sizeof(stored), f);
+    uint32_t rung   = 0;
+    size_t   gotFp  = fread(&stored, 1, sizeof(stored), f);
+    // A marker written by an older build is 8 bytes with no rung; treat the
+    // missing field as rung 0 rather than refusing to read it.
+    if (fread(&rung, 1, sizeof(rung), f) != sizeof(rung)) rung = 0;
     fclose(f);
-    return got == sizeof(stored) && stored == fp && fp != 0;
+    if (gotFp != sizeof(stored) || stored != fp || fp == 0) return -1;
+    return static_cast<int>(rung);
 }
 
-static void writeLoadMarker(const std::string& path, uint64_t fp) {
+static void writeLoadMarker(const std::string& path, uint64_t fp, uint32_t rung) {
     FILE* f = fopen(path.c_str(), "wb");
     if (!f) return;
-    fwrite(&fp, 1, sizeof(fp), f);
+    fwrite(&fp,   1, sizeof(fp),   f);
+    fwrite(&rung, 1, sizeof(rung), f);
     fclose(f);
 }
 
@@ -178,7 +226,7 @@ void Engine::clearLoadMarker() {
 bool Engine::load(const std::string& midiPath, const std::string& soundfontPath,
                   int voiceCount, float noteSpeed, uint64_t cpuMask,
                   bool legacyRenderer, bool allowChunked,
-                  const std::string& poolDir) {
+                  const std::string& poolDir, bool force) {
     sfPath_     = soundfontPath;
     voiceCount_ = voiceCount < 1 ? 1 : voiceCount;
     noteSpeed_  = noteSpeed;
@@ -203,7 +251,7 @@ bool Engine::load(const std::string& midiPath, const std::string& soundfontPath,
     // A streaming load then sorts in RAM (the old ceiling) unless the skim
     // predicts even that transient can't fit — the truly giant MIDIs — where
     // the chunked on-disk sort takes over IF the user opted into it
-    // ("Chunked Disk Streaming" in Advanced Settings); with the toggle off
+    // ("Chunked Disk Paging" in Advanced Settings); with the toggle off
     // the load is refused with kLoadNeedsChunked instead of dying to lmkd
     // on every attempt.
     markerPath_ = loadMarkerPath(midiPath);
@@ -243,8 +291,16 @@ bool Engine::load(const std::string& midiPath, const std::string& soundfontPath,
     // parse cannot fit. If it did, "fall back to the in-RAM parse" is not a
     // fallback — it is the thing we already know will be OOM-killed.
     bool predictedTooBig = false;
-    if (markerMatches(markerPath_, fp)) {
-        LOGI("previous load of this MIDI died — using the streaming pool");
+    // Rung 0 unless a marker survives for THIS MIDI, in which case the previous
+    // attempt was killed and we come back holding less.
+    const int diedAt = markerRung(markerPath_, fp);
+    uint32_t rung = 0;
+    if (diedAt >= 0) {
+        rung = static_cast<uint32_t>(diedAt) + 1;
+        if (rung > kMaxPressureRung) rung = kMaxPressureRung;
+        LOGI("previous load of this MIDI died at pressure rung %d — retrying at "
+             "rung %u of %u, keeping less resident", diedAt, rung,
+             kMaxPressureRung);
         wantStream = true;
     } else if (events > 0 && budgetBasis > 0) {
         uint64_t predictedBytes =
@@ -270,7 +326,7 @@ bool Engine::load(const std::string& midiPath, const std::string& soundfontPath,
             events * kSortTransientPerEvent > budget) {
             if (!allowChunked) {
                 LOGI("predicted sort transient %.1f MB > %.1f MB budget and "
-                     "Chunked Disk Streaming is off — refusing the load",
+                     "Chunked Disk Paging is off — refusing the load",
                      events * kSortTransientPerEvent / 1048576.0,
                      budget / 1048576.0);
                 loadError_ = kLoadNeedsChunked;
@@ -293,8 +349,73 @@ bool Engine::load(const std::string& midiPath, const std::string& soundfontPath,
         }
         return true;
     };
+    // The mode is settled; now ask whether it can actually run on this device as
+    // it stands. Nothing inside the streamer asks: priceWork() probes the very
+    // same blocks with mmap(PROT_NONE, MAP_NORESERVE), which buys ADDRESS SPACE
+    // and not commit — on a 64-bit process that cannot fail (its own comment
+    // says so), and it was written for 32-bit fragmentation, not for RAM. So a
+    // load that cannot possibly fit still logs "working set priced as 4 blocks"
+    // and proceeds, and the first thing that notices is lmkd.
+    //
+    // Measured, S22 Ultra, Toilet Story 3 (448.7M events, 2026-09-12): a 6909 MB
+    // working set priced clean against 7220 MB of total RAM, then took nine
+    // minutes to reach ~5.1 GB committed — the launcher, the keyboard, GMS and
+    // 24 other processes reaped on the way — before lmkd took aPFA itself at
+    // adj 0. Twice, identically. This gate is what turns that into a dialog.
+    auto priceAgainstAvailable = [&]() -> bool {
+        const uint64_t avail = apfa::platform::availableMemoryBytes();
+        // 0 is "could not tell", not "no memory" — never refuse on that.
+        if (avail == 0 || events == 0) return true;
+        const uint64_t swap  = apfa::platform::swapFreeBytes();
+        const uint64_t floor = Streamer::residentFloorBytes(events, chunked);
+        const uint64_t anon  = Streamer::anonCommitBytes(events, chunked);
+        const uint64_t ramRoom =
+            static_cast<uint64_t>(avail * kResidentAvailableFraction);
+        const uint64_t anonRoom =
+            static_cast<uint64_t>((avail + swap) * kAnonCommitFraction);
+        // Recorded even when the load proceeds, so the UI can quote real
+        // numbers if it comes back to offer "load anyway".
+        gateNeed_ = anon;
+        gateRoom_ = anonRoom;
+        if (force) {
+            LOGI("memory gate OVERRIDDEN by the user: %.1f MB resident floor, "
+                 "%.1f MB anonymous against %.1f MB free + %.1f MB swap — "
+                 "proceeding anyway, this load is expected to be killed",
+                 floor / 1048576.0, anon / 1048576.0, avail / 1048576.0,
+                 swap / 1048576.0);
+            return true;
+        }
+        // Random-access tables against RAM alone: swap cannot hold these.
+        if (floor > ramRoom) {
+            LOGI("streaming load needs %.1f MB resident at random > %.1f MB "
+                 "(%.0f%% of the %.1f MB this device can still give) — "
+                 "refusing the load",
+                 floor / 1048576.0, ramRoom / 1048576.0,
+                 kResidentAvailableFraction * 100.0, avail / 1048576.0);
+            loadError_ = kLoadNoResidentRam;
+            return false;
+        }
+        // Total anonymous commit against RAM + swap. This is the one a big
+        // chunked load fails: the floor fits, and then events[] exhausts swap.
+        if (anon > anonRoom) {
+            LOGI("streaming load commits %.1f MB anonymous (%.1f MB of it "
+                 "events[] via swap) > %.1f MB (%.0f%% of %.1f MB free + "
+                 "%.1f MB swap) — refusing the load",
+                 anon / 1048576.0, (anon - floor) / 1048576.0,
+                 anonRoom / 1048576.0, kAnonCommitFraction * 100.0,
+                 avail / 1048576.0, swap / 1048576.0);
+            loadError_ = kLoadNoResidentRam;
+            return false;
+        }
+        LOGI("streaming load: %.1f MB resident floor, %.1f MB anonymous total "
+             "against %.1f MB free + %.1f MB swap — proceeding",
+             floor / 1048576.0, anon / 1048576.0, avail / 1048576.0,
+             swap / 1048576.0);
+        return true;
+    };
     if (wantStream && !decideChunkedSort()) return false;
-    writeLoadMarker(markerPath_, fp);
+    if (wantStream && !priceAgainstAvailable()) return false;
+    writeLoadMarker(markerPath_, fp, rung);
     markerArmed_ = true;
     // At most two passes: the in-RAM parse may hand the load to the streaming
     // pool, never the reverse twice (predictedTooBig is latched when it does).
@@ -304,6 +425,9 @@ bool Engine::load(const std::string& midiPath, const std::string& soundfontPath,
         // (3.0s * noteSpeed_, matching the windowUs there) rather than a fixed
         // horizon — see the note at the top of streamer.h.
         streamer_.setVisibleUs(static_cast<int64_t>(3000000.0 * noteSpeed_));
+        // Learned from the last attempt, if there was one: rung 0 on a clean
+        // first try, higher after a kill. Residency only — never the layout.
+        streamer_.setPressureRung(rung);
         // A load that runs out of memory must fail, not abort. The pool's
         // tables are the largest allocations the app ever makes, and on a
         // 32-bit process an operator new that cannot be satisfied throws
@@ -340,7 +464,7 @@ bool Engine::load(const std::string& midiPath, const std::string& soundfontPath,
                 if (streamer_.needsChunked() && !chunked) {
                     if (!allowChunked) {
                         LOGI("needs the chunked on-disk sort to fit the address "
-                             "space, and Chunked Disk Streaming is off");
+                             "space, and Chunked Disk Paging is off");
                         loadError_ = kLoadNeedsChunked;
                         return false;
                     }
@@ -644,8 +768,9 @@ void Engine::threadMain() {
 
         if (paused_.load()) {
             if (synthPlaying) { synth_.pause(); synthPlaying = false; }
-            // Still render the paused frame (seek may have moved the view),
-            // then sleep — mirroring PFA's paused Logic()/Render() path.
+            // PFA's MainScreen keeps running Logic()+Render() at full (vsync)
+            // rate while paused and keeps counting FPS (GameState.cpp:1119).
+            // Its Sleep(10) is IntroScreen-only, so there is no sleep here.
             buildVisible();
             int sw = surfW_.load(), sh = surfH_.load();
             if (sw > 0 && sh > 0) renderer_->resize(sw, sh);
@@ -653,8 +778,24 @@ void Engine::threadMain() {
             syncBgImage();
             renderer_->render(clockUs_ * 1e-6f, midi_.totalUs * 1e-6f, pubFps_.load(),
                              3.0f * noteSpeed_, instances_, keyColor_);
-            usleep(10000);   // 10 ms idle — matches PFA's paused Sleep(10)
-            lastWall_ = nowUs();
+            uint64_t now = nowUs();
+            lastWall_ = now;
+            fpsFrames_++;
+            if (now - fpsLastUs_ >= 500000) {
+                pubFps_.store(fpsFrames_ * 1e6f / static_cast<float>(now - fpsLastUs_));
+                // Re-baseline the perf window so the next perf:/state:/fault:
+                // lines describe playback only, not a pause.
+                fpsFrames_ = 0;
+                fpsLastUs_ = now;
+                cpuLastUs_ = nowThreadCpuUs();
+                majFltLast_ = threadMajFlt();
+#ifdef APFA_STREAMING
+                ldrFltLast_ = streamer_.loaderMajFlt();
+#endif
+                sumDispatchUs_ = sumBuildUs_ = 0;
+                maxDispatchUs_ = maxBuildUs_ = 0;
+                polySum_ = polyMax_ = dispEvents_ = 0;
+            }
             continue;
         }
         if (!synthPlaying) { synth_.resume(); synthPlaying = true; }
@@ -776,7 +917,7 @@ void Engine::frame() {
 }
 
 void Engine::dispatch() {
-    const std::vector<PlayEvent*>& ev = midi_.events;
+    const EventSpan& ev = midi_.events;
     const size_t n = ev.size();
     const size_t startCursor = eventCursor_;
 #ifdef APFA_STREAMING
@@ -835,7 +976,7 @@ void Engine::dispatch() {
 }
 
 void Engine::buildVisible() {
-    const std::vector<PlayEvent*>& ev     = midi_.events;
+    const EventSpan& ev     = midi_.events;
     const std::vector<uint32_t>&   colors = midi_.trackColors;
     const size_t n = ev.size();
 
@@ -925,7 +1066,7 @@ void Engine::applySeek(int64_t target) {
     // to the start shows "-0:03" instead of snapping to 0:00.
     if (target < minTimeUs()) target = minTimeUs();
     if (target > maxTimeUs()) target = maxTimeUs();
-    const std::vector<PlayEvent*>& ev = midi_.events;
+    const EventSpan& ev = midi_.events;
     const size_t n = ev.size();
 
     clockUs_ = target;

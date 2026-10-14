@@ -31,6 +31,7 @@ SDK          ?= $(HOME)/sdks/iPhoneOS.sdk
 CLANG        ?= clang
 LD64         ?= arm64-apple-darwin20-ld
 LDID         ?= ldid
+LIPO         ?= arm64-apple-darwin20-lipo
 TARGET       ?= arm64-apple-ios12.0
 BUILD        ?= build
 APP           = $(BUILD)/aPFA.app
@@ -98,6 +99,7 @@ check:
 	@test -d "$(SDK)" || { echo "SDK not found at $(SDK) — set SDK=..."; exit 1; }
 	@command -v $(CLANG) >/dev/null || { echo "clang not found"; exit 1; }
 	@command -v $(LD64)  >/dev/null || { echo "$(LD64) not found — build cctools-port"; exit 1; }
+	@command -v $(LIPO)  >/dev/null || { echo "$(LIPO) not found — build cctools-port"; exit 1; }
 	@test -d $(BASS_FW)  || { echo "BASS missing — run 'make deps'"; exit 1; }
 	@echo "toolchain ok"
 
@@ -119,6 +121,12 @@ $(APP): check $(OBJ) Info.plist
 	cp Info.plist $(APP)/Info.plist
 	cp -R $(BASS_FW)     $(APP)/Frameworks/
 	cp -R $(BASSMIDI_FW) $(APP)/Frameworks/
+	# Thin the fat armv7/armv7s/arm64 frameworks to arm64 — see the same step
+	# in .github/workflows/ios.yml for why (Sideloadly, macho sign/edit -18).
+	$(LIPO) $(APP)/Frameworks/bass.framework/bass         -thin arm64 \
+		-output $(APP)/Frameworks/bass.framework/bass
+	$(LIPO) $(APP)/Frameworks/bassmidi.framework/bassmidi -thin arm64 \
+		-output $(APP)/Frameworks/bassmidi.framework/bassmidi
 	@if [ -n "$(LAUNCH_STORYBOARDC)" ]; then \
 		cp -R "$(LAUNCH_STORYBOARDC)" $(APP)/LaunchScreen.storyboardc; \
 	else \

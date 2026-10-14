@@ -31,7 +31,7 @@ public:
 
     // legacyRenderer selects the ES2 "Legacy Renderer (GLES 2.0)" path on
     // Android. allowChunked permits the streamer's chunked on-disk sort
-    // ("Chunked Disk Streaming" in Advanced Settings) — it does NOT force
+    // ("Chunked Disk Paging" in Advanced Settings) — it does NOT force
     // streaming: whether a load streams at all stays automatic (RAM-fit
     // prediction / crash marker), and the chunked sort is picked only when
     // the un-chunked load transient wouldn't fit either (streaming builds
@@ -43,19 +43,31 @@ public:
     bool load(const std::string& midiPath, const std::string& soundfontPath,
               int voiceCount, float noteSpeed, uint64_t cpuMask,
               bool legacyRenderer = false, bool allowChunked = false,
-              const std::string& poolDir = std::string());
+              const std::string& poolDir = std::string(),
+              // Proceed even when the memory gate says the load cannot fit.
+              // The gate is advisory only when the caller asks for it to be:
+              // the user has been shown the cost and said go anyway.
+              bool force = false);
     // Why load() returned false, for the UI's error message. Generic parse
     // failures stay kLoadErrNone (the caller's default message covers them).
     enum LoadError {
         kLoadErrNone      = 0,
-        kLoadNeedsChunked = 1,   // needs "Chunked Disk Streaming", toggle is off
+        kLoadNeedsChunked = 1,   // needs "Chunked Disk Paging", toggle is off
         kLoadDiskFull     = 2,   // free-space guard: pagefile would exhaust storage
         kLoadFileTooBig   = 3,   // pagefile past the volume's limit (FAT32's 4 GB)
         kLoadNoAddrSpace  = 4,   // pool's VA reservation failed (32-bit process)
         kLoadTooBigForRam = 5,   // streaming unavailable and the parse can't fit
         kLoadNoMergeRam   = 6,   // chunked, but sisterPos_+inv[] still won't fit
+        kLoadNoResidentRam = 7,  // tables can't be evicted and won't fit in what
+                                 // the device can still give RIGHT NOW (the two
+                                 // above are priced against total RAM, so they
+                                 // answer "ever", not "now")
     };
     int loadError() const { return loadError_; }
+    // What the memory gate measured on the last load, so the UI can quote it
+    // when it offers to proceed anyway. Both 0 if the gate did not run.
+    uint64_t gateNeedBytes() const { return gateNeed_; }
+    uint64_t gateRoomBytes() const { return gateRoom_; }
     std::atomic<float>& loadProgress() { return loadProgress_; }
 
     int64_t noteCount()   const { return static_cast<int64_t>(midi_.noteCount()); }
@@ -144,6 +156,8 @@ private:
     void*             window_ = nullptr;   // ANativeWindow* (Android) / CAEAGLLayer* (iOS)
 
     int      loadError_  = kLoadErrNone;   // set by load() on failure (see enum)
+    uint64_t gateNeed_   = 0;              // anon bytes the gate priced
+    uint64_t gateRoom_   = 0;              // what it priced them against
     int      voiceCount_ = 250;
     float    noteSpeed_  = 0.05f;
     uint64_t cpuMask_    = 0;

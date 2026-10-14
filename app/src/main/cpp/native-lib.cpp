@@ -24,6 +24,10 @@ ANativeWindow*             g_window = nullptr;   // UI-thread only
 // Engine::loadError() of the last nativeLoad, stashed here because a failed
 // load's engine is deleted before the UI thread can ask why it failed.
 std::atomic<int>           g_lastLoadError{0};
+// Same idea for the memory gate's two numbers, so the UI can quote what it
+// measured when it offers to load anyway.
+std::atomic<uint64_t> g_lastGateNeed{0};
+std::atomic<uint64_t> g_lastGateRoom{0};
 
 std::string jstr(JNIEnv* env, jstring s) {
     if (!s) return std::string();
@@ -43,7 +47,7 @@ Java_com_apfa_PlaybackActivity_nativeLoad(JNIEnv* env, jobject, jstring midiPath
                                           jfloat noteSpeed, jlong cpuMask,
                                           jboolean legacyRenderer,
                                           jboolean allowChunked,
-                                          jstring poolDir) {
+                                          jstring poolDir, jboolean force) {
     apfa::Engine* old = g_engine.exchange(nullptr);
     if (old) { old->stop(); delete old; }
 
@@ -54,8 +58,11 @@ Java_com_apfa_PlaybackActivity_nativeLoad(JNIEnv* env, jobject, jstring midiPath
                        static_cast<uint64_t>(cpuMask),
                        legacyRenderer == JNI_TRUE,
                        allowChunked == JNI_TRUE,
-                       jstr(env, poolDir));
+                       jstr(env, poolDir),
+                       force == JNI_TRUE);
     g_lastLoadError.store(e->loadError());
+    g_lastGateNeed.store(e->gateNeedBytes());
+    g_lastGateRoom.store(e->gateRoomBytes());
     if (!ok) {
         g_engine.store(nullptr);
         delete e;
@@ -65,11 +72,24 @@ Java_com_apfa_PlaybackActivity_nativeLoad(JNIEnv* env, jobject, jstring midiPath
 }
 
 // Why the last nativeLoad returned false — Engine::LoadError (1 = needs
-// Chunked Disk Streaming, 2 = not enough free storage, 3 = pagefile past the
+// Chunked Disk Paging, 2 = not enough free storage, 3 = pagefile past the
 // volume's file-size limit, 0 = generic).
 JNIEXPORT jint JNICALL
 Java_com_apfa_PlaybackActivity_nativeGetLoadError(JNIEnv*, jobject) {
     return g_lastLoadError.load();
+}
+
+// The memory gate's two numbers from the last nativeLoad, in bytes: what the
+// load needs, and what the device could give it. Both 0 if the gate did not
+// run. Used only to put real figures in the "load anyway?" prompt.
+JNIEXPORT jlong JNICALL
+Java_com_apfa_PlaybackActivity_nativeGetGateNeedBytes(JNIEnv*, jobject) {
+    return static_cast<jlong>(g_lastGateNeed.load());
+}
+
+JNIEXPORT jlong JNICALL
+Java_com_apfa_PlaybackActivity_nativeGetGateRoomBytes(JNIEnv*, jobject) {
+    return static_cast<jlong>(g_lastGateRoom.load());
 }
 
 JNIEXPORT jfloat JNICALL

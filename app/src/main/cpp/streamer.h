@@ -54,11 +54,19 @@
 // per-track advisories are still needed because 61-133 interleaved streams in
 // one mapping defeat the kernel's own sequential readahead detector.
 //
-// Residency ~= events[] table + sisterPos + the sliding window
+// Residency ~= events[] table + the sliding window
 // [playhead - back, playhead + front] (defaults below, env-tunable via
 // APFA_WIN_FRONT_US / APFA_WIN_BACK_US, which pin the horizon and disable the
 // adaptive sizing). The pool never needs to be resident at once, which is the
 // entire point.
+//
+// sisterPos_ used to be in that list and is not any more: it is a file mapping
+// now (MappedU32 below), which took 4 B/event of anonymous memory out of every
+// chunked load — 1.7 GB on a 448M-event MIDI, and the single thing that made
+// Toilet Story 3 unloadable on an 8 GB phone. That is safe to do to sisterPos_
+// precisely because PFA does not have it: PFA keeps the sister pointer inside
+// the event (note.h:55). Nothing that mirrors PFA's layout may be treated this
+// way.
 //
 // Replaying a MIDI is cheap for the same reason it is in PFA, and cheaper: the
 // mapping is PROT_READ|MAP_PRIVATE, so pool pages are always CLEAN. Eviction
@@ -103,7 +111,8 @@ namespace apfa {
 // Segment boundaries are multiples of lcm(sizeof(PlayEvent), page size), so no
 // event ever straddles two segments, and the hot path compiles to exactly the
 // same code walking exactly the same addresses.
-// ---- sliced pool (32-bit only; see SLICED-POOL-DESIGN.md) -------------------
+// ---- sliced pool (32-bit, and 64-bit where kFatBuildCanSlice) ---------------
+// see SLICED-POOL-DESIGN.md
 //
 // One slice of the song. Its pool holds, laid out track by track exactly as the
 // full pool is:
@@ -136,6 +145,13 @@ struct SlicePlan {
 // budgetEvents is the arena expressed in events, minEvents stops a pathological
 // note-wall (carry alone exceeding the budget) from producing empty slices; a
 // slice may exceed the budget only when it cannot be cut any smaller.
+// Pointer form, so a caller whose sisterPos table is a file mapping (MappedU32)
+// can plan without copying 1.7 GB into a vector to satisfy the signature. The
+// vector overload below is what tests/slice_test.cpp uses.
+std::vector<SlicePlan> planSlices(const uint32_t* sisterPos, size_t n,
+                                  uint32_t budgetEvents,
+                                  uint32_t minEvents);
+
 std::vector<SlicePlan> planSlices(const std::vector<uint32_t>& sisterPos,
                                   uint32_t budgetEvents,
                                   uint32_t minEvents);
@@ -165,6 +181,52 @@ inline size_t poolOffIn(const std::vector<PoolSeg>& segs, const void* p) {
     return 0;
 }
 
+// A uint32 side table that lives in a FILE rather than in anonymous memory.
+//
+// Same elements, same indices, same order, same access pattern as the
+// std::vector it replaces — ONLY residency changes. Its dirty pages are written
+// back and then clean, so the kernel can evict and re-read them and the table
+// costs page cache the kernel sizes to whatever RAM is free, instead of anon
+// pages that only swap can hold. This is exactly the argument this header opens
+// with ("identical layout, kernel-managed residency"), applied to one more
+// table.
+//
+// It is ONLY ever valid for aPFA's OWN bookkeeping — sisterPos_ and friends,
+// which PFA does not have (PFA keeps the sister pointer inside the event:
+// note.h:55 m_pSister). It must NEVER be applied to anything that mirrors PFA's
+// layout: not PlayEvent, not the pool, and not events[]'s element type. Those
+// reproduce PFA's footprint and cache working-set on purpose, and shrinking one
+// would make aPFA faster than the thing it exists to measure.
+struct MappedU32 {
+    uint32_t* p = nullptr;
+    size_t    n = 0;
+    size_t    bytes = 0;
+    // Non-empty when the table chose to stay in RAM (see assignResident).
+    std::vector<uint32_t> owned;
+
+    // Keep the table in ordinary memory. Correct whenever it FITS, and much
+    // faster than the file when the write pattern is random: pass D places
+    // 2 entries per note at scattered positions, and through a mapping each of
+    // those can fault a page in, dirty it, and cost a writeback. Measured on
+    // Toilet Story 3: file-backed placement was still unfinished after 8
+    // minutes, against a load that otherwise completes in ~10.
+    bool assignResident(size_t count, uint32_t fill);
+
+    // Fills `count` entries with `fill` in a mapping over `fd` (which the
+    // caller owns and must keep open for the life of the table). `fill` must be
+    // byte-uniform — kSisNonNote/kSisNoteOff are 0xFF.. and 0xFE.., and only
+    // the former is ever used as a fill.
+    bool assign(int fd, size_t count, uint32_t fill);
+    void clear();
+
+    size_t size()  const { return n; }
+    bool   empty() const { return n == 0; }
+    uint32_t*       data()       { return p; }
+    const uint32_t* data() const { return p; }
+    uint32_t&       operator[](size_t i)       { return p[i]; }
+    const uint32_t& operator[](size_t i) const { return p[i]; }
+};
+
 class Streamer {
 public:
     // sisterPos values for non-note events and note-offs. Everything below
@@ -193,7 +255,7 @@ public:
     // open() (and by MainActivity at launch).
     //
     // `chunked` selects the sort strategy for pass B/D ("Chunked Disk
-    // Streaming" in Advanced Settings, chosen by Engine::load only when
+    // Paging" in Advanced Settings, chosen by Engine::load only when
     // needed): false = the whole (key, idx) table and note-pair list stay in
     // RAM until pass D — a 16 B/event + 8 B/note load transient that caps
     // un-chunked loads at roughly 80 M notes on an 8 GB phone; true = keys
@@ -220,29 +282,37 @@ public:
     // (Android's FUSE layer hides the real type behind its own magic).
     bool fileTooBig() const { return fileTooBig_; }
     // True when the last open() failed because the pool's virtual address
-    // range could not be reserved. The pool is ONE contiguous VA reservation
-    // (sister pointers are precomputed against its base), so a 32-bit process
-    // — a 64-bit SoC running a 32-bit ROM very much included — tops out around
-    // 2-3 GB of user address space for everything. Distinct from the other two
-    // because falling back to the in-RAM parse cannot help: a MIDI whose pool
-    // will not fit in the address space is exactly a MIDI whose in-RAM parse
-    // will not fit in RAM either, so the fallback just guarantees an OOM kill.
+    // range could not be reserved, AND slicing either isn't available (Android
+    // 64-bit — see kFatBuildCanSlice in streamer.cpp) or couldn't find room for
+    // its arenas/working set either. The whole-pool reservation is ONE
+    // contiguous VA range (sister pointers are precomputed against its base),
+    // so a 32-bit process — a 64-bit SoC running a 32-bit ROM very much
+    // included — tops out around 2-3 GB of user address space for everything;
+    // iOS tops out near installed physical RAM instead (no swap, no VA
+    // overcommit past it). Distinct from the other two because falling back to
+    // the in-RAM parse cannot help: a MIDI whose pool will not fit in the
+    // address space is exactly a MIDI whose in-RAM parse will not fit in RAM
+    // either, so the fallback just guarantees an OOM kill.
     bool noAddrSpace() const { return noAddrSpace_; }
     // Set alongside noAddrSpace() when the un-chunked sort was what did not
     // fit, and the chunked on-disk sort — which spills that table instead of
     // holding it — would have. The load is not impossible, it just needs the
-    // other mode ("Chunked Disk Streaming").
+    // other mode ("Chunked Disk Paging").
     bool needsChunked() const { return needsChunked_; }
     void close();
     bool isOpen() const { return base_ != nullptr; }
 
-    // ---- sliced pool (32-bit only; see SLICED-POOL-DESIGN.md) ---------------
+    // ---- sliced pool (32-bit, and 64-bit where kFatBuildCanSlice) -----------
+    // see SLICED-POOL-DESIGN.md
     //
     // True when this load took the sliced path: the full pool file is written
     // exactly as before but NEVER mapped, and the engine walks one slice at a
     // time through a fixed pair of arenas. The address-space cost becomes the
-    // arena, not the song, so free storage is the only ceiling left. A 64-bit
-    // build never gets here (open() refuses to slice when sizeof(void*) > 4).
+    // arena, not the song, so free storage (RAM, on iOS) is the only ceiling
+    // left. An Android 64-bit build never gets here — open() refuses to slice
+    // there when sizeof(void*) > 4, because that platform's 64-bit VA is
+    // field-validated to not need it. iOS does, because its 64-bit VA is
+    // capped near physical RAM instead. See kFatBuildCanSlice in streamer.cpp.
     bool isSliced() const { return sliced_; }
     // Where dispatch() has to stop and call advanceSlice(): the current slice's
     // plan boundary, which is exactly where the notes sounding across it become
@@ -295,6 +365,16 @@ public:
     // drift from what pass D actually allocates.
     static uint64_t mergeResidentBytes(uint64_t events);
 
+    // Anonymous cost of a streaming load, split by where the bytes can live:
+    // residentFloorBytes() is hit at random and must be in RAM; anonCommitBytes()
+    // adds what the chunked merge can push to swap (events[], written through by
+    // position). The pool is in neither — it is file-backed and droppable.
+    // The engine prices both before the load starts, because priceWork() inside
+    // open() reserves the same blocks only as ADDRESS SPACE, which on a 64-bit
+    // process can never fail and so gates nothing.
+    static uint64_t residentFloorBytes(uint64_t events, bool chunked);
+    static uint64_t anonCommitBytes(uint64_t events, bool chunked);
+
     // For events[] position `pos`: kSisNonNote, kSisNoteOff, or (for a
     // note-on) the events[] position of its note-off. Lets applySeek rebuild
     // active_ without dereferencing the pool for every historical event
@@ -307,6 +387,18 @@ public:
     // before startLoader (Engine::load); ignored once APFA_WIN_FRONT_US pins
     // the horizon.
     void setVisibleUs(int64_t visibleUs);
+
+    // How hard to chunk. 0 is the ordinary load. Each rung above that halves
+    // what the adaptive structures are allowed to keep resident — the inv[]
+    // window, the merge read buffers, and the loader's read-ahead horizon — so
+    // a MIDI that was killed holding too much comes back holding less. Set
+    // before open(); see the crash marker in engine.cpp.
+    //
+    // It changes RESIDENCY ONLY. The pool, PlayEvent, and the time-sorted
+    // events[] walk are identical at every rung — a higher rung is a slower
+    // load, never a different one (note.h).
+    void setPressureRung(uint32_t rung) { pressureRung_ = rung; }
+    uint32_t pressureRung() const { return pressureRung_; }
 
     // Start/stop the read-ahead thread. `playheadUs` is the engine's published
     // clock (Engine::pubTimeUs_); `initialUs` seeds the window before the
@@ -453,12 +545,20 @@ private:
     std::vector<std::string> tempPaths_;
 
     // ---- resident tables ----
-    std::vector<uint32_t>    sisterPos_;     // per events[] position (see above)
+    MappedU32                sisterPos_;     // per events[] position (see above)
+    int                      sisterFd_ = -1; // backs sisterPos_; open for its life
+    // events[] backing. Same 8-byte PlayEvent* elements in the same order as
+    // ever — see EventSpan in midi_parser.h — just mapped from a file so the
+    // table is page cache the kernel can drop, not anonymous memory only swap
+    // can hold. 8 B/event is the largest single anon cost a chunked load has.
+    int                      eventsFd_ = -1;
+    void*                    eventsMap_ = nullptr;
+    size_t                   eventsMapBytes_ = 0;
     std::vector<TrackRange>  trackRange_;    // pool-index span per track
     std::vector<uint32_t>    trackSampleOff_;// per-track offset into trackSamples_
     std::vector<TrackSample> trackSamples_;  // every kTrackSampleStep events
     std::vector<int64_t>     posTimes_;      // events[] time every kPosSampleStep
-    const std::vector<PlayEvent*>* events_ = nullptr;  // out.events (stable after open)
+    const EventSpan* events_ = nullptr;  // out.events (stable after open)
 
     // ---- loader ----
     std::thread          loaderThread_;
@@ -469,6 +569,7 @@ private:
     uint64_t             engineCpuMask_ = 0;
     int64_t              frontUs_ = 0, backUs_ = 0;   // window horizons
     int64_t              visibleUs_ = 0;    // buildVisible's band (setVisibleUs)
+    uint32_t             pressureRung_ = 0; // see setPressureRung
     bool                 frontPinned_ = false;  // APFA_WIN_FRONT_US was set
     // Published for the "win:" line — see windowFrontUs() and friends.
     std::atomic<int64_t>  winFrontUs_{0};
@@ -517,7 +618,7 @@ private:
     // scattered I/O, already well past what a 100 ms tick can absorb.
     static constexpr size_t  kMaxSisterTouchPerTick = 4096;
 
-    // ---- sliced pool state (32-bit only) ------------------------------------
+    // ---- sliced pool state (32-bit, and 64-bit where kFatBuildCanSlice) -----
     bool     sliced_   = false;
     // The pool: open for the whole session, and never mapped. ONE file on a
     // 64-bit build, always. On 32-bit it becomes a chain of sub-2 GB links once
@@ -544,7 +645,7 @@ private:
     // on the other parity). The loader must not advise — let alone touch — an
     // arena that is not backed by a slice.
     bool     sliceLive_ = false;
-    std::vector<PlayEvent*>* eventsMut_ = nullptr;   // out.events, to repoint
+    EventSpan* eventsMut_ = nullptr;   // out.events, to repoint
     std::string poolDirUsed_;         // where slice temps are created
     bool     poolKeepNamed_ = false;  // ...and whether they keep their names
 

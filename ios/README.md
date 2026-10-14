@@ -190,7 +190,7 @@ jetsam kills at a per-process footprint limit near half of it — so the budget 
 70% of `os_proc_available_memory()`, measured before the parse allocates
 anything. `Engine::load` logs both numbers once per load.
 
-**Chunked Disk Streaming is in the setup screen.** MainActivity buries it in an
+**Chunked Disk Paging is in the setup screen.** MainActivity buries it in an
 "Advanced Settings" dialog; here it is a switch in the settings column, with the
 same confirmation text minus the 32-bit paragraph (this target is arm64-only, so
 the pagefile is never split into 2 GB pieces). It matters more on iOS than on

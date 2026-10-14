@@ -114,6 +114,28 @@ constexpr size_t kSegGrain = (kEventSize / gcdConst(kEventSize, kPageSize)) * kP
 constexpr size_t kSegMin   = 8u << 20;
 constexpr size_t kMaxSegs  = 32;
 
+// Whether a 64-bit process may fall back to slicing when the whole-pool
+// reservation fails, instead of refusing outright. Android's 64-bit VA is
+// field-validated to not fail this way — terabytes of address space do not
+// fragment, so a failure there is something slicing cannot fix either. iOS is
+// different: it has no swap, and a single virtual-memory reservation larger
+// than installed physical RAM is refused even though it is PROT_NONE and asks
+// for no backing store (confirmed 2026-09-13 against a 68M-note load: an
+// 8589 MB reservation failed outright on a device reporting 7.53 GB RAM).
+// Apple's `com.apple.developer.kernel.extended-virtual-addressing` entitlement
+// exists specifically to lift this ceiling, but it requires an App ID
+// capability from a paid Apple Developer Program membership — unavailable to
+// a free-Apple-ID / sideloaded signing identity, which is how this app is
+// distributed on iOS. So iOS gets the same arena/slicing fallback Android's
+// 32-bit builds already use, RAM-capped instead of VA-capped.
+// APFA_TEST_SLICE64 lets the host suite exercise this branch on a native
+// 64-bit build without needing Darwin at all — see tests/slicepool_test.cpp.
+#if defined(__APPLE__) || defined(APFA_TEST_SLICE64)
+constexpr bool kFatBuildCanSlice = true;
+#else
+constexpr bool kFatBuildCanSlice = false;
+#endif
+
 int64_t envUs(const char* name, int64_t fallback) {
     const char* v = getenv(name);
     if (!v || !*v) return fallback;
@@ -564,7 +586,7 @@ struct EmitSink {
     // Sort keys. chunked=false (the automatic path): runBuf holds EVERY key
     // until pass D — 16 B/event resident, the load transient that caps
     // un-chunked streaming at ~80 M notes on an 8 GB phone (it's what lmkd
-    // killed at 78% on NoK 90M). chunked=true ("Chunked Disk Streaming"):
+    // killed at 78% on NoK 90M). chunked=true ("Chunked Disk Paging"):
     // keys spill to disk in pre-sorted 32 MB runs and a k-way merge in pass D
     // consumes them — no transient, storage-bound only.
     bool     chunked = false;
@@ -807,10 +829,116 @@ uint64_t readMemAvailable() {
 
 // ---- predict -------------------------------------------------------------------
 
+// ---- file-backed side tables ------------------------------------------------
+
+bool MappedU32::assignResident(size_t count, uint32_t fill) {
+    clear();
+    if (count == 0) return true;
+    try {
+        owned.assign(count, fill);
+    } catch (const std::bad_alloc&) {
+        return false;                 // caller falls back to the file
+    }
+    p     = owned.data();
+    n     = count;
+    bytes = count * sizeof(uint32_t);
+    return true;
+}
+
+bool MappedU32::assign(int fd, size_t count, uint32_t fill) {
+    clear();
+    if (count == 0) return true;
+    if (fd < 0) return false;
+    const size_t want = count * sizeof(uint32_t);
+
+    // Fill on DISK in bounded chunks rather than memset-ing the whole table
+    // through the mapping. A single memset would dirty every page in one burst
+    // — gigabytes of dirty page cache at once — and spike exactly the memory
+    // pressure this table exists to avoid. Chunked pwrite lets writeback keep
+    // pace, and leaves the pages clean behind it.
+    constexpr size_t kFillChunk = 4u << 20;              // 4 MB of entries
+    std::vector<uint32_t> buf(kFillChunk / sizeof(uint32_t), fill);
+    size_t off = 0;
+    while (off < want) {
+        const size_t n2 = std::min(kFillChunk, want - off);
+        if (pwrite(fd, buf.data(), n2, static_cast<off_t>(off))
+                != static_cast<ssize_t>(n2)) {
+            LOGE("streamer: could not write the %zu MB sister table", want >> 20);
+            return false;
+        }
+        off += n2;
+    }
+
+    void* m = mmap(nullptr, want, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    if (m == MAP_FAILED) {
+        LOGE("streamer: could not map the %zu MB sister table", want >> 20);
+        return false;
+    }
+    p     = static_cast<uint32_t*>(m);
+    n     = count;
+    bytes = want;
+    return true;
+}
+
+void MappedU32::clear() {
+    if (p != nullptr && owned.empty()) munmap(p, bytes);
+    std::vector<uint32_t>().swap(owned);
+    p = nullptr; n = 0; bytes = 0;
+}
+
 uint64_t Streamer::mergeResidentBytes(uint64_t events) {
-    return events * sizeof(uint32_t)                       // sisterPos_
-         + static_cast<uint64_t>(kInvWindowMin) * sizeof(uint32_t)
+    // sisterPos_ USED to dominate this (4 B/event, the whole session, 1.7 GB on
+    // a 448M-event MIDI). It lives in a file now — see MappedU32 — so what is
+    // left that pass D genuinely cannot evict is the inv[] window and the room
+    // it keeps clear around it. Deliberately keeps the `events` parameter: the
+    // windowed build still scales its passes with the event count, and a future
+    // rung may put a per-event term back.
+    (void)events;
+    return static_cast<uint64_t>(kInvWindowMin) * sizeof(uint32_t)
          + kInvWindowReserve;                              // smallest inv window
+}
+
+// What a streaming load costs in ANONYMOUS memory, split by where those bytes
+// can actually live. The pool is in neither number and must not be: it is
+// file-backed, so its pages are clean and the kernel can drop and re-read them.
+//
+// residentFloorBytes = hit at RANDOM, so it has to be in RAM. Swap does not
+// help here — a random-access table in swap is a major fault per access, and
+// the load dies of thrash long before it dies of OOM.
+//
+// The chunked merge is the whole reason these are two numbers and not one. It
+// spills the sort keys and the pairs, windows inv[] down to kInvWindowMin when
+// memory is tight (see pass D), and writes events[] straight through BY
+// POSITION — so events[] leaves as clean sequential runs that swap absorbs
+// (measured on a Redmi Note 9: RSS held at 147 MB while 1168 MiB of events[]
+// went out). What is left random is sisterPos_ plus the inv window, which is
+// exactly mergeResidentBytes().
+//
+// Counting events[] as resident is wrong and expensive: it charges 8 B/event
+// that the merge never holds, which refuses ~100M-note MIDIs this device loads
+// today. Counting it as free is also wrong: swap is finite and shared, and
+// events[] at 8 B/event is what exhausts it on a file big enough.
+uint64_t Streamer::residentFloorBytes(uint64_t events, bool chunked) {
+    if (!chunked)                     // nothing spills: the whole bill is random
+        return events * (sizeof(PlayEvent*) + sizeof(uint32_t) +
+                         sizeof(uint32_t) + sizeof(SortKey));
+    return mergeResidentBytes(events) + kMergeBudget;
+}
+
+// Everything anonymous the load commits, the swap-tolerant part included. This
+// is the number that has to fit in RAM *plus* swap; residentFloorBytes() is the
+// part of it that has to fit in RAM alone.
+uint64_t Streamer::anonCommitBytes(uint64_t events, bool chunked) {
+    // A chunked load has no swap-backed term left. events[] used to be it —
+    // 8 B/event written through by position and left for swap to absorb, which
+    // worked until the table outgrew the whole zram device (3.4 GB of events[]
+    // against 4 GB of swap shared with the rest of Android: Toilet Story 3,
+    // reaped three times). It is a file mapping now, so it costs evictable page
+    // cache instead and nothing here has to reserve room for it.
+    //
+    // The un-chunked path is unchanged: it spills nothing, so its floor already
+    // counts every table including events[].
+    return residentFloorBytes(events, chunked);
 }
 
 uint64_t Streamer::predictEventCount(const std::string& midiPath) {
@@ -861,8 +989,13 @@ uint64_t Streamer::predictEventCount(const std::string& midiPath) {
 std::vector<SlicePlan> planSlices(const std::vector<uint32_t>& sisterPos,
                                   uint32_t budgetEvents,
                                   uint32_t minEvents) {
+    return planSlices(sisterPos.data(), sisterPos.size(), budgetEvents, minEvents);
+}
+
+std::vector<SlicePlan> planSlices(const uint32_t* sisterPos, size_t n,
+                                  uint32_t budgetEvents,
+                                  uint32_t minEvents) {
     std::vector<SlicePlan> out;
-    const size_t n = sisterPos.size();
     if (n == 0 || budgetEvents == 0) return out;
     if (minEvents == 0) minEvents = 1;
 
@@ -1060,12 +1193,14 @@ bool Streamer::open(const std::string& midiPath, MidiData& out,
     //
     //   1. THE WHOLE POOL, reserved up front in one piece or — on a 32-bit
     //      process with the room but not in one run — several, then mapped over
-    //      the reservation MAP_FIXED. The shipped path, and the only one a
-    //      64-bit build will accept.
-    //   2. SLICED (32-bit only): the pool file is written and NEVER mapped. One
-    //      slice at a time lives in a fixed pair of arenas, so the address space
-    //      stops scaling with the song and free storage becomes the ceiling
-    //      instead. See SLICED-POOL-DESIGN.md.
+    //      the reservation MAP_FIXED. The shipped path, and the only one an
+    //      Android 64-bit build will accept — iOS can fall through to (2), see
+    //      kFatBuildCanSlice.
+    //   2. SLICED (32-bit, and 64-bit where kFatBuildCanSlice): the pool file
+    //      is written and NEVER mapped. One slice at a time lives in a fixed
+    //      pair of arenas, so the address space stops scaling with the song
+    //      and free storage (or, on iOS, RAM) becomes the ceiling instead. See
+    //      SLICED-POOL-DESIGN.md.
     //
     // Reserving the pool is not the end of the story either: the rest of the
     // load still has to allocate, and the pool can take so much of a 32-bit
@@ -1079,7 +1214,7 @@ bool Streamer::open(const std::string& midiPath, MidiData& out,
     // every one of them needs a contiguous run of its OWN:
     //
     //   events[]    totalEvents * sizeof(PlayEvent*)  held all session
-    //   sisterPos_  totalEvents * 4                   held all session
+    //   sisterPos_  (file-backed now — see MappedU32, not priced here)
     //   inv[]       totalEvents * 4                   through pass D
     //   poolIdx_    totalEvents * 4    sliced only    held all session
     //   posUs_      totalEvents * 4    sliced only    held all session
@@ -1104,8 +1239,17 @@ bool Streamer::open(const std::string& midiPath, MidiData& out,
     auto workBlocks = [&](bool slicedShape, bool chunkedShape) {
         const size_t tbl = totalEvents * sizeof(uint32_t);
         std::vector<WorkBlock> b;
-        b.push_back({ totalEvents * sizeof(PlayEvent*), true });  // events[]
-        b.push_back({ tbl, true });                               // sisterPos_
+        // Neither events[] nor sisterPos_ is priced here any more: both are file
+        // mappings now, so neither needs an anonymous home, and pricing them
+        // would reserve 12 B/event of address space nothing wants while
+        // overstating this check's headline number by gigabytes on a big MIDI.
+        // (It reported "6909 MB" for a Toilet Story 3 load whose real anonymous
+        // cost is 192 MB.) The un-chunked path still holds everything, so it
+        // still prices everything — see below.
+        if (!chunkedShape) {
+            b.push_back({ totalEvents * sizeof(PlayEvent*), true });   // events[]
+            b.push_back({ tbl, true });                               // sisterPos_
+        }
         b.push_back({ tbl, true });                               // inv[]
         if (slicedShape) {
             b.push_back({ tbl, true });                           // poolIdx_
@@ -1156,10 +1300,12 @@ bool Streamer::open(const std::string& midiPath, MidiData& out,
     };
 
     // APFA_FORCE_SLICED takes the sliced path even when the whole pool would
-    // map, so the 32-bit-only code can be exercised on a -m32 host build (see
-    // tests/slicepool_test.cpp). It is deliberately inert in a 64-bit process:
-    // a 64-bit build never slices, no exceptions.
-    const bool forceSliced = sizeof(void*) == 4 && getenv("APFA_FORCE_SLICED") &&
+    // map, so the code can be exercised on a host build without needing a
+    // failing reservation to trigger it (see tests/slicepool_test.cpp). Inert
+    // on a 64-bit build that can't slice (Android): there, forcing it would
+    // test a path production never takes.
+    const bool forceSliced = (sizeof(void*) == 4 || kFatBuildCanSlice) &&
+                             getenv("APFA_FORCE_SLICED") &&
                              *getenv("APFA_FORCE_SLICED") == '1';
     bool sliced = false;
     if (forceSliced) {
@@ -1179,21 +1325,26 @@ bool Streamer::open(const std::string& midiPath, MidiData& out,
         sliced = true;
     }
 
-    if (sliced && sizeof(void*) > 4) {
-        // A 64-bit build never slices. 256 TB of address space does not run out
-        // by fragmentation, so a failure here is something slicing cannot fix —
-        // except by spilling the sort table, which is a mode the caller can
-        // switch to, so say so before refusing.
+    if (sliced && sizeof(void*) > 4 && !kFatBuildCanSlice) {
+        // Android's 64-bit build never slices. 256 TB of address space does not
+        // run out by fragmentation there, so a failure here is something
+        // slicing cannot fix — except by spilling the sort table, which is a
+        // mode the caller can switch to, so say so before refusing. (iOS takes
+        // the branch below instead — see kFatBuildCanSlice.)
         if (!chunked && priceWork(false, true)) {
             needsChunked_ = true;
             LOGI("streamer: the chunked sort's working set would fit where "
                  "the un-chunked one did not");
         }
+        // Report before close(), which zeroes mapLen_ — reading it afterwards is
+        // how this line used to claim "0 MB" for a reservation that had failed
+        // at several gigabytes (same trap documented below for arenaBytes_).
+        const size_t failedMapLen = mapLen_;
         munmap(midiMap, fileSize);
         close();
         noAddrSpace_ = true;
         LOGE("streamer: cannot reserve %zu MB of address space (64-bit process)",
-             mapLen_ >> 20);
+             failedMapLen >> 20);
         return false;
     }
 
@@ -1206,7 +1357,8 @@ bool Streamer::open(const std::string& midiPath, MidiData& out,
         // down to the floor, below which an arena could not cover the loader's
         // read-ahead horizon and the carry sets on top of it.
         // APFA_ARENA_BYTES pins the arena so a test can force many slices out
-        // of a small MIDI; ignored outside a 32-bit process, like slicing itself.
+        // of a small MIDI; meaningful wherever slicing itself is, i.e. a
+        // 32-bit process or a 64-bit one with kFatBuildCanSlice.
         //
         // The arenas are reserved BEFORE the working set is priced, and their
         // size is the one part of the sliced shape that is ours to choose. A
@@ -1499,7 +1651,42 @@ bool Streamer::open(const std::string& midiPath, MidiData& out,
     // 90M-note files through where the resident table gets lmkd reaped
     // ("low on swap and thrashing").
     progress.store(0.62f);
-    out.events.resize(totalEvents);
+    // events[] in a FILE, not in anonymous memory. Identical elements, identical
+    // order, identical addresses dereferenced — only the array's residency moves,
+    // which is this header's founding argument applied to the last big table.
+    // At 8 B/event it is the single largest anon cost of a chunked load (3.4 GB
+    // on a 448M-event MIDI) and the reason Toilet Story 3 exhausted zram.
+    {
+        const size_t want = totalEvents * sizeof(PlayEvent*);
+        eventsFd_ = makePoolTemp("events");
+        if (eventsFd_ >= 0 && wouldExhaustDisk(eventsFd_, want)) {
+            LOGE("streamer: not enough free storage for the %zu MB events[] table",
+                 want >> 20);
+            diskFull_ = true;
+            munmap(midiMap, fileSize);
+            close();
+            return false;
+        }
+        if (eventsFd_ < 0 || ftruncate(eventsFd_, static_cast<off_t>(want)) != 0) {
+            LOGE("streamer: could not size the %zu MB events[] table", want >> 20);
+            munmap(midiMap, fileSize);
+            close();
+            return false;
+        }
+        void* m = mmap(nullptr, want, PROT_READ | PROT_WRITE, MAP_SHARED,
+                       eventsFd_, 0);
+        if (m == MAP_FAILED) {
+            LOGE("streamer: could not map the %zu MB events[] table", want >> 20);
+            munmap(midiMap, fileSize);
+            close();
+            return false;
+        }
+        eventsMap_      = m;
+        eventsMapBytes_ = want;
+        out.eventsOwned.clear();
+        out.eventsOwned.shrink_to_fit();
+        out.events = { static_cast<PlayEvent**>(m), totalEvents };
+    }
     out.programChangeIdx.clear();
     posTimes_.clear();
     if (sliced) {
@@ -1612,7 +1799,59 @@ bool Streamer::open(const std::string& midiPath, MidiData& out,
     // that loads a MIDI today still loads it with the same code and the same
     // I/O. The windowing only ever engages where the load would not happen.
     {
-        sisterPos_.assign(totalEvents, kSisNonNote);
+        // sisterPos_ lives in a file, not in anon memory: it is aPFA's own side
+        // table (PFA keeps the sister pointer inside the event — note.h:55), so
+        // moving its residency changes nothing PFA-visible, and it is the single
+        // biggest anon table a chunked load holds (4 B/event for the whole
+        // session — 1.7 GB on a 448M-event MIDI).
+        // Resident when it FITS, file-backed only when it does not. This is the
+        // adaptive half of the same idea as the inv[] window: pass D writes
+        // sisterPos_ at scattered positions (2 per note), which a file mapping
+        // serves badly, so RAM is strongly preferred and the file is the
+        // fallback that keeps a too-big MIDI loadable at all. Each pressure
+        // rung shrinks the inv[] WINDOW rather than this table, which frees room
+        // and makes staying resident MORE likely on a retry, not less: pushing
+        // sisterPos_ to the file is the one move that reliably turns a load that
+        // dies into a load that never finishes, so the rung must not force it.
+        const uint64_t sisterWant = static_cast<uint64_t>(totalEvents) * 4;
+        const uint64_t sisAvail   = readMemAvailable();
+        const double   sisShare   = 0.5;
+        const bool sisterFits =
+            sisAvail > kInvWindowReserve &&
+            sisterWant < static_cast<uint64_t>(
+                (sisAvail - kInvWindowReserve) * sisShare);
+        if (sisterFits && sisterPos_.assignResident(totalEvents, kSisNonNote)) {
+            LOGI("streamer: sister table %llu MB resident (%llu MB available, "
+                 "rung %u)",
+                 (unsigned long long)(sisterWant >> 20),
+                 (unsigned long long)(sisAvail >> 20), pressureRung_);
+        } else {
+        LOGI("streamer: sister table %llu MB does not fit in %llu MB available "
+             "at rung %u — backing it with a file (slower placement, but it "
+             "loads)",
+             (unsigned long long)(sisterWant >> 20),
+             (unsigned long long)(sisAvail >> 20), pressureRung_);
+        sisterFd_ = makePoolTemp("sister");
+        // Both table files are new storage the load did not used to need, so
+        // they go through the same free-space guard as the pool and the spills:
+        // better a clean kLoadDiskFull than ENOSPC part-way through pass D.
+        if (sisterFd_ >= 0 &&
+            wouldExhaustDisk(sisterFd_, static_cast<uint64_t>(totalEvents) * 4)) {
+            LOGE("streamer: not enough free storage for the %zu MB sister table",
+                 (totalEvents * 4) >> 20);
+            diskFull_ = true;
+            munmap(midiMap, fileSize);
+            close();
+            return false;
+        }
+        if (sisterFd_ < 0 || !sisterPos_.assign(sisterFd_, totalEvents, kSisNonNote)) {
+            LOGE("streamer: could not back the %zu MB sister table with a file",
+                 (totalEvents * 4) >> 20);
+            munmap(midiMap, fileSize);
+            close();
+            return false;
+        }
+        }
 
         // Sized against what is free now that sisterPos_ is standing, not
         // against a prediction: pass D is the one place where guessing high
@@ -1625,9 +1864,14 @@ bool Streamer::open(const std::string& midiPath, MidiData& out,
             if (int64_t pinned = envUs("APFA_INV_WINDOW", 0)) {
                 invWin = static_cast<size_t>(pinned);
             } else if (uint64_t avail = readMemAvailable()) {
+                // Each pressure rung halves the share of headroom the window
+                // may take, so a load that was killed here last time comes back
+                // with a smaller window and more passes instead of dying again.
+                const double frac = kInvWindowFraction /
+                                    static_cast<double>(1u << pressureRung_);
                 uint64_t room = avail > kInvWindowReserve
-                    ? static_cast<uint64_t>((avail - kInvWindowReserve) *
-                                            kInvWindowFraction) / sizeof(uint32_t)
+                    ? static_cast<uint64_t>((avail - kInvWindowReserve) * frac)
+                      / sizeof(uint32_t)
                     : 0;
                 if (room < totalEvents)
                     invWin = static_cast<size_t>(
@@ -1879,7 +2123,8 @@ bool Streamer::open(const std::string& midiPath, MidiData& out,
         // start the moment load() returns.
         uint32_t budget = static_cast<uint32_t>(std::min<size_t>(
             arenaEvents() * kSliceBudgetNum / kSliceBudgetDen, kSisNoteOff - 1));
-        plan_ = planSlices(sisterPos_, budget, kSliceMinEvents);
+        plan_ = planSlices(sisterPos_.data(), sisterPos_.size(), budget,
+                           kSliceMinEvents);
         size_t worst = 0;
         for (const SlicePlan& spn : plan_)
             if (spn.poolEvents() > worst) worst = spn.poolEvents();
@@ -1948,7 +2193,11 @@ void Streamer::close() {
     tempPaths_.clear();
     tempPaths_.shrink_to_fit();
     mapLen_ = poolBytes_ = totalEvents_ = 0;
-    sisterPos_.clear();      sisterPos_.shrink_to_fit();
+    sisterPos_.clear();
+    if (sisterFd_ >= 0) { ::close(sisterFd_); sisterFd_ = -1; }
+    if (eventsMap_ != nullptr) { munmap(eventsMap_, eventsMapBytes_); }
+    eventsMap_ = nullptr; eventsMapBytes_ = 0;
+    if (eventsFd_ >= 0) { ::close(eventsFd_); eventsFd_ = -1; }
     trackRange_.clear();     trackRange_.shrink_to_fit();
     trackSamples_.clear();   trackSamples_.shrink_to_fit();
     trackSampleOff_.clear(); trackSampleOff_.shrink_to_fit();
@@ -1963,7 +2212,8 @@ void Streamer::close() {
     memAvail_.store(0, std::memory_order_relaxed);
 }
 
-// ---- sliced pool (32-bit only; see SLICED-POOL-DESIGN.md) ---------------------
+// ---- sliced pool (32-bit, and 64-bit where kFatBuildCanSlice) ------------------
+// see SLICED-POOL-DESIGN.md
 //
 // The pool file is written exactly as before and then never mapped. Instead the
 // song is cut into slices (planSlices), each slice is materialised into its own
@@ -2340,7 +2590,7 @@ bool Streamer::buildSlice(int sliceIdx, SliceMap& out) {
 }
 
 void Streamer::installSliceLocked(SliceMap& s, int64_t playheadUs) {
-    std::vector<PlayEvent*>& ev = *eventsMut_;
+    EventSpan& ev = *eventsMut_;
     uint8_t* const base = arena_[s.arena];
     // Repoint events[] at the slice. Global positions never change, so the
     // engine's cursors, active_ and noteState_ stay exactly what they were —
@@ -2668,7 +2918,7 @@ void Streamer::loaderTickLocked(int64_t t) {
     // Between dropping one slice and installing the next there is nothing to
     // advise and nothing safe to touch — the arena is a PROT_NONE reservation.
     if (sliced_ && !sliceLive_) return;
-    const std::vector<PlayEvent*>& ev = *events_;
+    const EventSpan& ev = *events_;
     // Only positions inside the mapped slice have live events[] pointers, so
     // that — not the whole song — is what every scan below is bounded by.
     const size_t n = sliced_ ? cur_.matEnd : totalEvents_;
@@ -2795,7 +3045,7 @@ void Streamer::warmSeek(int64_t targetUs, int64_t visibleEndUs,
     if (!isOpen()) return;
     if (sliced_ && !sliceLive_) return;
     std::lock_guard<std::mutex> lk(mutex_);
-    const std::vector<PlayEvent*>& ev = *events_;
+    const EventSpan& ev = *events_;
 
     resetWindowLocked(targetUs);
     frontPos_ = coarsePosOf(targetUs);   // let the next tick re-scan the window
@@ -2870,8 +3120,12 @@ size_t Streamer::memoryBytes() const {
     // Under the lock throughout: a slice transition swaps the per-track tables
     // and the slot maps, and this is called from the UI thread.
     std::lock_guard<std::mutex> lk(mutex_);
-    size_t tables = sisterPos_.capacity() * sizeof(uint32_t) +
-                    trackRange_.capacity() * sizeof(TrackRange) +
+    // sisterPos_ is NOT counted here any more: it lives in a file now, so it is
+    // page cache the kernel can drop, in the same category as the pool — and
+    // the pool is measured separately below by what is actually resident.
+    // Counting its full length as process RAM would report the one table this
+    // change exists to get OUT of RAM as though it were still in it.
+    size_t tables = trackRange_.capacity() * sizeof(TrackRange) +
                     trackSamples_.capacity() * sizeof(TrackSample) +
                     trackSampleOff_.capacity() * sizeof(uint32_t) +
                     posTimes_.capacity() * sizeof(int64_t) +

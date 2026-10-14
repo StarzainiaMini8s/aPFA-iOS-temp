@@ -9,7 +9,7 @@
 //   • Pagefile on SD     — no removable storage to put it on. The pool always
 //                          goes beside the MIDI in the app container.
 //
-// "Chunked Disk Streaming" IS here: the streaming pool builds for iOS now, and
+// "Chunked Disk Paging" IS here: the streaming pool builds for iOS now, and
 // on iOS the toggle earns its place more than it does on Android, because the
 // un-chunked sort's RAM transient is priced against a jetsam limit that is
 // roughly half of a device's RAM rather than against the RAM itself.
@@ -46,7 +46,7 @@ typedef NS_ENUM(NSInteger, APFAPickTarget) {
     float     _noteSpeed;
     uint32_t  _bgColor;         // PFA BGR packing: R = bits 0-7, G = 8-15, B = 16-23
     NSString *_bgImagePath;
-    BOOL      _chunked;         // "Chunked Disk Streaming"
+    BOOL      _chunked;         // "Chunked Disk Paging"
 
     APFAPickTarget _pickTarget;
 
@@ -71,7 +71,7 @@ typedef NS_ENUM(NSInteger, APFAPickTarget) {
     // (the home-screen label truncates at roughly a dozen characters, so a
     // longer one would read as "aPFA (for..."), and the playback bar keeps
     // the short form because it doubles as the back chevron's label in a
-    // 60 pt slot. This screen is where there is room to say it.
+    // 72 pt slot. This screen is where there is room to say it.
     self.title = @"aPFA (for iOS)";
     // UINavigationController builds the playback screen's back button out of
     // THIS title, so without an override the chevron would read
@@ -266,7 +266,7 @@ static int progressFromSpeed(float s) {
     chunkRow.axis      = UILayoutConstraintAxisHorizontal;
     chunkRow.spacing   = 8;
     chunkRow.alignment = UIStackViewAlignmentCenter;
-    UILabel *chunkLabel = [self label:@"Chunked Disk Streaming"];
+    UILabel *chunkLabel = [self label:@"Chunked Disk Paging"];
     chunkLabel.font = [UIFont systemFontOfSize:14];
     _chunkSwitch = [[UISwitch alloc] init];
     _chunkSwitch.on = _chunked;
@@ -289,7 +289,7 @@ static int progressFromSpeed(float s) {
         return;
     }
     UIAlertController *a = [UIAlertController
-        alertControllerWithTitle:@"Chunked Disk Streaming"
+        alertControllerWithTitle:@"Chunked Disk Paging"
                          message:@"Sorts a huge MIDI's pagefile in chunks on "
                                   "disk instead of in RAM, so Black MIDIs too "
                                   "big for normal disk streaming can load, the "

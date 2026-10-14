@@ -31,6 +31,7 @@
     // playback screen
     APFAGLView   *_glView;
     UIView       *_bar;
+    UIButton     *_backButton;
     UISlider     *_seekBar;
     UIButton     *_pauseButton;
     UILabel      *_startingOverlay;
@@ -107,6 +108,13 @@
     [_seekLink invalidate];
     [UIApplication sharedApplication].idleTimerDisabled = NO;
     if (!_released) apfaRelease();
+}
+
+- (void)viewWillDisappear:(BOOL)animated {
+    [super viewWillDisappear:animated];
+    // Setup needs its navigation bar back; showPlaybackScreen hid it.
+    if (self.isMovingFromParentViewController)
+        [self.navigationController setNavigationBarHidden:NO animated:animated];
 }
 
 - (void)viewDidDisappear:(BOOL)animated {
@@ -234,7 +242,7 @@
                 switch (apfaGetLoadError()) {
                     case 1:
                         [self fail:@"This Black MIDI likely needs Chunked Disk "
-                                    "Streaming, please enable it in Settings."];
+                                    "Paging, please enable it in Settings."];
                         break;
                     case 2:
                         [self fail:@"Not enough space on iPhone to load this MIDI! "
@@ -252,7 +260,7 @@
                                     "much memory one app may hold — well under "
                                     "the amount the device has — and this load "
                                     "asked for more than was left. Turning on "
-                                    "Chunked Disk Streaming moves the biggest "
+                                    "Chunked Disk Paging moves the biggest "
                                     "part of that to disk; if it is already on, "
                                     "this MIDI needs a device with more RAM."];
                         break;
@@ -263,7 +271,7 @@
                         break;
                     case 6:
                         [self fail:@"This MIDI is too big for this device's RAM. "
-                                    "Chunked Disk Streaming moves the sort to "
+                                    "Chunked Disk Paging moves the sort to "
                                     "disk, but the last stage of the load still "
                                     "has to hold a note index in RAM that cannot "
                                     "be streamed, and this MIDI's index is bigger "
@@ -367,6 +375,13 @@
     dbl.numberOfTapsRequired = 2;
     [_glView addGestureRecognizer:dbl];
 
+    // One bar, like PlaybackActivity's action bar: back, seek, pause. The
+    // navigation controller's own bar stayed up on top of ours, a translucent
+    // "< aPFA" strip with nothing else on it, and because iOS 11+ counts it in
+    // safeAreaInsets.top it also pushed the seek slider and pause button down
+    // into a second bar under it. It is hidden only now, not in viewWillAppear,
+    // so the loading screen keeps its system back button.
+    [self.navigationController setNavigationBarHidden:YES animated:NO];
     [self buildTransportBar];
 
     _startingOverlay = [[UILabel alloc] initWithFrame:self.view.bounds];
@@ -401,15 +416,22 @@
     CGFloat y    = [self topInset];
     CGFloat left = [self sideInset] + 12;
 
-    UILabel *title = [[UILabel alloc] initWithFrame:CGRectMake(left, y, 60, barH)];
-    title.text      = @"aPFA";
-    title.textColor = [UIColor whiteColor];
-    title.font      = [UIFont boldSystemFontOfSize:18];
-    [_bar addSubview:title];
+    // Where Android's bar has a plain "aPFA" title, this one is the way back:
+    // an iPhone has no system back key, and the navigation bar that carried
+    // the chevron is hidden while this bar is up.
+    _backButton = [UIButton buttonWithType:UIButtonTypeSystem];
+    _backButton.frame = CGRectMake(left, y, 72, barH);
+    _backButton.contentHorizontalAlignment = UIControlContentHorizontalAlignmentLeft;
+    _backButton.titleLabel.font = [UIFont boldSystemFontOfSize:18];
+    [_backButton setTitle:@"‹ aPFA" forState:UIControlStateNormal];
+    [_backButton setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
+    [_backButton addTarget:self action:@selector(goBack)
+          forControlEvents:UIControlEventTouchUpInside];
+    [_bar addSubview:_backButton];
 
     CGFloat pauseW = 54;
     CGFloat rightEdge = self.view.bounds.size.width - [self sideInset] - 12;
-    CGFloat sliderX = CGRectGetMaxX(title.frame) + 16;
+    CGFloat sliderX = CGRectGetMaxX(_backButton.frame) + 16;
 
     _seekBar = [[UISlider alloc] initWithFrame:
                 CGRectMake(sliderX, y, rightEdge - pauseW - 8 - sliderX, barH)];
@@ -435,6 +457,8 @@
 
     [self.view addSubview:_bar];
 }
+
+- (void)goBack { [self.navigationController popViewControllerAnimated:YES]; }
 
 - (CGFloat)topInset {
     if (@available(iOS 11.0, *)) return self.view.safeAreaInsets.top;
@@ -465,12 +489,10 @@
     CGFloat left      = side + 12;
     CGFloat rightEdge = width - side - 12;
     CGFloat pauseW    = 54;
-    CGFloat titleW    = 60;
+    CGFloat backW     = 72;
 
-    for (UIView *v in _bar.subviews) {
-        if ([v isKindOfClass:[UILabel class]]) v.frame = CGRectMake(left, top, titleW, barH);
-    }
-    CGFloat sliderX = left + titleW + 16;
+    _backButton.frame  = CGRectMake(left, top, backW, barH);
+    CGFloat sliderX = left + backW + 16;
     _seekBar.frame     = CGRectMake(sliderX, top,
                                     MAX(40, rightEdge - pauseW - 8 - sliderX), barH);
     _pauseButton.frame = CGRectMake(rightEdge - pauseW, top, pauseW, barH);
